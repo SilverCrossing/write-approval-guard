@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Write Approval Guard",
+    "description": "Require approval for every write-type file operation, a second confirmation for destructive or system-level changes, and approval before reading secret-bearing files."
+  }
+}

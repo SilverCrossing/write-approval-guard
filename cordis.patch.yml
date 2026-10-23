@@ -1,0 +1,11 @@
+# Bundle layer: the write-approval guard row.
+# highRiskConfirmations: double asks a separate first confirmation for
+# destructive or system-level operations; the ordinary approval that follows is
+# the second one, so both dialogs must be approved. A profile patch can override
+# this row by id.
+- insert:
+    - id: write-approval-guard
+      name: write-approval-guard
+      config:
+        mode: enforce
+        highRiskConfirmations: double
