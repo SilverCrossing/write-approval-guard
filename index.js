@@ -301,6 +301,33 @@ function registerCommand(ctx, config, getMode, setMode) {
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
   const logger = createLogger('write-approval-guard', config)
+  const pending = new Map()
+  const MAX_PENDING = 256
+
+  function rememberAsk(exec, decision) {
+    if (exec.callId === undefined) return
+    if (pending.size >= MAX_PENDING) {
+      const oldest = pending.keys().next().value
+      if (oldest !== undefined) pending.delete(oldest)
+    }
+    pending.set(exec.callId, { tool: exec.name, kind: decision.kind ?? 'unknown', risk: decision.risk ?? 'normal' })
+  }
+
+  // Observation only: let the normal answerers decide, then record the outcome.
+  ctx.on('approval/request', async (request, next) => {
+    const outcome = await next()
+    try {
+      const known = request.callId !== undefined ? pending.get(request.callId) : undefined
+      if (known !== undefined) {
+        pending.delete(request.callId)
+        logger.write({ event: 'approval', outcome, tool: known.tool, kind: known.kind, risk: known.risk, agent: request.agent?.id })
+      }
+    } catch {
+      // Logging must never change the approval outcome.
+    }
+    return outcome
+  })
+
   let mode = config.mode
 
   registerCommand(ctx, config, () => mode, value => {
@@ -343,6 +370,7 @@ export function apply(ctx, rawConfig) {
     }
 
     if (decision.risk === 'high' && config.highRiskConfirmations === 'double') {
+      rememberAsk(exec, decision)
       const first = await confirmHighRisk(ctx, exec, decision, config)
       if (first !== null) {
         logger.write({ event: first.kind === 'cancel' ? 'cancel' : 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'high-risk-step1', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
@@ -354,6 +382,7 @@ export function apply(ctx, rawConfig) {
     // `onReject: "turn"` needs the outcome, so this plugin asks the ordinary
     // approval itself instead of delegating it to the runtime.
     if (config.onReject === 'turn') {
+      rememberAsk(exec, decision)
       const outcome = await requestDecision(ctx, exec, decision)
       if (outcome.allowed === true) {
         logger.write({ event: 'allow', tool: exec.name, kind: decision.kind, risk: decision.risk, onReject: 'turn', agent: exec.agent?.id })
@@ -373,6 +402,7 @@ export function apply(ctx, rawConfig) {
 
     if (exec.signal !== undefined && exec.signal.aborted) return { kind: 'cancel' }
 
+    rememberAsk(exec, decision)
     logger.write({ event: 'ask', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
     return {
       kind: 'ask',

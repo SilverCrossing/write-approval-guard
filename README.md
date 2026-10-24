@@ -224,7 +224,7 @@
 {"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","reason":"..."}
 ```
 
-- `event`：`ask` / `deny` / `cancel` / `allow` / `mode`；
+- `event`：`ask` / `deny` / `cancel` / `allow` / `mode` / `approval`（审批结果：allowed-once / rejected / cancelled / unavailable）；
 - 只记录**被判定过**的调用（普通读取不会产生日志）；
 - 写日志失败只告警，不影响拦截；
 - `log: false` 关闭，`logDir` 换目录，`logRetentionDays` 改保留天数。

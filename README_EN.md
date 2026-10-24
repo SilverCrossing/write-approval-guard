@@ -222,7 +222,7 @@ Every decision appends one JSONL line to `$DSH_HOME/logs/write-approval-guard/YY
 {"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","reason":"..."}
 ```
 
-- `event`: `ask` / `deny` / `cancel` / `allow` / `mode`;
+- `event`: `ask` / `deny` / `cancel` / `allow` / `mode` / `approval` (the outcome: allowed-once / rejected / cancelled / unavailable);
 - only calls that were classified are logged (ordinary reads produce nothing);
 - a failed write only warns and never affects interception;
 - `log: false` disables it, `logDir` changes the directory, `logRetentionDays` changes retention.
