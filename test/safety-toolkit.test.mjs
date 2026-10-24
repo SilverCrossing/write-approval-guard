@@ -60,11 +60,12 @@ test('multi_edit keeps the strongest verdict across its files', () => {
   assert.equal(decision.risk, 'high')
 })
 
-test('multi_edit flags a sensitive target', () => {
+test('multi_edit flags a configuration target as high risk', () => {
   const decision = call('multi_edit', {
     edits: [{ file: path.join(workspace, '.env'), old: 'A=1', new: 'A=2' }],
   })
-  assert.equal(decision.kind, 'sensitive-write')
+  assert.equal(decision.kind, 'config-write')
+  assert.equal(decision.risk, 'high')
 })
 
 test('safe_write to a system path is high risk', () => {

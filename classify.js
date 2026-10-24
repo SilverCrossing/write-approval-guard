@@ -111,6 +111,57 @@ export const DEFAULT_SENSITIVE_PATTERNS = Object.freeze([
   '**/key4.db',
 ])
 
+/**
+ * Files that change how other programs behave: shell startup scripts, git
+ * hooks, editor task files, agent instruction files, and environment or
+ * package-manager configuration. Writing one grants influence far beyond a
+ * single edit — a shell profile runs at the next login, a git hook at the next
+ * commit — so these are high risk rather than ordinary writes.
+ */
+export const DEFAULT_CONFIG_PATTERNS = Object.freeze([
+  '**/.bashrc',
+  '**/.bash_profile',
+  '**/.bash_login',
+  '**/.profile',
+  '**/.zshrc',
+  '**/.zshenv',
+  '**/.zprofile',
+  '**/.config/fish/config.fish',
+  '**/Microsoft.PowerShell_profile.ps1',
+  '**/Microsoft.VSCode_profile.ps1',
+  '**/profile.ps1',
+  '**/.git/hooks/**',
+  '**/.git/config',
+  '**/.gitmodules',
+  '**/.vscode/tasks.json',
+  '**/.vscode/launch.json',
+  '**/.vscode/settings.json',
+  '**/.vscode/mcp.json',
+  '**/.idea/runConfigurations/**',
+  '**/.mcp.json',
+  '**/.cursor/mcp.json',
+  '**/AGENTS.md',
+  '**/CLAUDE.md',
+  '**/.cursorrules',
+  '**/.github/copilot-instructions.md',
+  '**/.dsh-prompts/**',
+  '**/.config',
+  '**/.config/**',
+  '**/*.config',
+  '**/.env',
+  '**/.env.*',
+  '**/*.env',
+  '**/.npmrc',
+  '**/.yarnrc',
+  '**/.yarnrc.yml',
+  '**/pip.conf',
+  '**/cordis.patch.yml',
+  '**/cordis.yml',
+])
+
+/** The same targets as they appear in a shell command line. */
+const CONFIG_TEXT = /(?:^|[\s"'`(=:,\\/])(?:\.bashrc|\.bash_profile|\.bash_login|\.zshrc|\.zshenv|\.zprofile|config\.fish|Microsoft\.(?:PowerShell|VSCode)_profile\.ps1|profile\.ps1|\.git[\/\\]hooks[\/\\][^\s"'`;|&<>]*|\.git[\/\\]config|\.gitmodules|\.vscode[\/\\](?:tasks|launch|settings|mcp)\.json|\.mcp\.json|AGENTS\.md|CLAUDE\.md|\.cursorrules|\.dsh-prompts|\.config(?:[\/\\][^\s"'`;|&<>]*)?|\.env(?:\.[\w.-]+)?|\.npmrc|\.yarnrc|pip\.conf|cordis(?:\.patch)?\.yml|\$(?:env:)?profile)(?=$|[\s"'`;|&<>),])/i
+
 /** System locations: writing here is high risk on every platform. */
 export function defaultSystemRoots() {
   if (!WINDOWS) {
@@ -475,6 +526,14 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
         `高危：命令将修改系统位置（${systemTarget}），将执行：${short(text)}`,
       )
     }
+    if (CONFIG_TEXT.test(text)) {
+      return decision(
+        'config-write',
+        'high',
+        `High-risk command writing a configuration or behavior file: ${short(text)}`,
+        `高危：命令将写入配置/行为文件：${short(text)}`,
+      )
+    }
     const sensitive = SENSITIVE_TEXT.test(text) || tokens.some(token => matchSensitive(token, sensitivePatterns) !== null)
     if (sensitive) {
       return decision(
@@ -504,7 +563,7 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
   return null
 }
 
-function classifyWrite(tool, value, cwd, { systemRoots, sensitivePatterns, exemptPaths }) {
+function classifyWrite(tool, value, cwd, { systemRoots, sensitivePatterns, exemptPaths, configPatterns }) {
   const target = value.trim()
   const absolute = absoluteOf(target, cwd)
   const real = absolute === null ? null : realpathDeep(absolute)
@@ -518,6 +577,15 @@ function classifyWrite(tool, value, cwd, { systemRoots, sensitivePatterns, exemp
         `高危：将写入系统位置：${short(candidate)}`,
       )
     }
+  }
+
+  if (matchSensitiveAny([absolute, real, target], configPatterns) !== null) {
+    return decision(
+      'config-write',
+      'high',
+      `High-risk write to a configuration or behavior file: ${short(absolute ?? target)}`,
+      `高危：将写入配置/行为文件：${short(absolute ?? target)}`,
+    )
   }
 
   if (absolute !== null && exemptPaths.some(root => isInside(root, absolute))) return null
@@ -632,6 +700,10 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
     ...(Array.isArray(config.extraSystemRoots) ? config.extraSystemRoots : []),
   ]
   const exemptPaths = Array.isArray(config.exemptPaths) ? config.exemptPaths : []
+  const configPatterns = [
+    ...DEFAULT_CONFIG_PATTERNS,
+    ...(Array.isArray(config.extraConfigPaths) ? config.extraConfigPaths : []),
+  ]
   const gateShell = config.gateShell !== false
   const shellMode = config.shellMode === 'lenient' || config.shellMode === 'off' ? config.shellMode : 'conservative'
   const sensitiveRisk = config.sensitiveReadConfirmations === 'double' ? 'high' : 'normal'
@@ -657,7 +729,7 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
     if (args === null || typeof args !== 'object') return null
     const values = pathReader(args).filter(value => typeof value === 'string' && value.trim() !== '')
     if (values.length === 0) return null
-    const decision = classifyWriteMany(name, values, cwd, { systemRoots, sensitivePatterns, exemptPaths })
+    const decision = classifyWriteMany(name, values, cwd, { systemRoots, sensitivePatterns, exemptPaths, configPatterns })
     if (decision !== null && name === 'safe_rollback') {
       return withRollbackNote(decision, args, values[0], cwd)
     }

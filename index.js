@@ -96,6 +96,7 @@ function normalizeConfig(raw) {
     onReject,
     unknownTools,
     gateWrites,
+    extraConfigPaths: stringList(config.extraConfigPaths, 'extraConfigPaths', []),
     highRiskConfirmations,
     sensitiveReadConfirmations,
     gateShell: config.gateShell !== false,

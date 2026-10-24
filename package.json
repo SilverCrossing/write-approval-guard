@@ -1,6 +1,6 @@
 {
   "name": "write-approval-guard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "license": "MIT",
   "author": "SilverCrossing",
@@ -9,7 +9,7 @@
     "url": "git+https://github.com/SilverCrossing/write-approval-guard.git"
   },
   "type": "module",
-  "description": "Approval for every write-type file operation, a second confirmation for destructive or system-level changes, and approval before reading secret-bearing configuration files.",
+  "description": "Per-write or risky-only approval for file writes, a second confirmation for system paths, configuration and behavior files, and destructive commands, and approval before reading secret-bearing files.",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",

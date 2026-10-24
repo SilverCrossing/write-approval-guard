@@ -54,10 +54,10 @@ test('reading a private key asks', () => {
   assert.equal(call('read', { file_path: path.join(workspace, 'id_rsa') }).kind, 'sensitive-read')
 })
 
-test('writing a sensitive file asks once (not high risk)', () => {
+test('writing an env file is high risk (configuration)', () => {
   const decision = call('write', { file_path: path.join(workspace, '.env') })
-  assert.equal(decision.kind, 'sensitive-write')
-  assert.equal(decision.risk, 'normal')
+  assert.equal(decision.kind, 'config-write')
+  assert.equal(decision.risk, 'high')
 })
 
 test('grep with a sensitive include pattern asks', () => {

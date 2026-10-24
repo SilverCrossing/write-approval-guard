@@ -48,6 +48,23 @@
 
 破坏性 Git（`reset --hard`、`clean -xdf`）和包管理器写入**不算**高危，只走单次审批；这是按使用者的选择定的，避免日常疲劳。
 
+## 配置与行为文件
+
+写入下面这些文件会获得**超出单次编辑的持续影响力**——shell 启动脚本下次登录就执行、git hook 下次提交就运行、编辑器任务文件在打开目录时执行、`.dsh-prompts/**` 会进入系统提示词。所以它们单独归为高危（两次确认），既不是普通写也不是“敏感写”：
+
+| 类别 | 路径 |
+| --- | --- |
+| shell 启动脚本 | `.bashrc`、`.bash_profile`、`.profile`、`.zshrc`、`.zprofile`、PowerShell `profile.ps1` |
+| git 钩子与配置 | `.git/hooks/**`、`.git/config`、`.gitmodules` |
+| 编辑器自动执行 | `.vscode/tasks.json`、`.vscode/launch.json`、`.vscode/settings.json`、`.vscode/mcp.json` |
+| 影响 AI 行为的文件 | `AGENTS.md`、`CLAUDE.md`、`.cursorrules`、`.dsh-prompts/**` |
+| 环境与包管理配置 | `.env*`、`.npmrc`、`.yarnrc`、`pip.conf`、`cordis.patch.yml` |
+| 应用配置目录与文件 | `.config`、`.config/**`、`*.config` |
+
+命令行写这些文件（`Set-Content $PROFILE`、`echo x > .bashrc`）同样升为高危。`extraConfigPaths` 可以追加自己的路径。
+
+注意：`.env` 的写入因此从“单次审批”变成“两次确认”——环境变量属于持久影响力，值得多一下。
+
 ## 敏感读取
 
 默认匹配（可用 `sensitivePaths` 覆盖；传 `[]` 关闭）：
@@ -140,6 +157,7 @@
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
     gateWrites: all                # all | risky
+    extraConfigPaths: []           # 追加“配置/行为文件”路径
     highRiskConfirmations: double  # double | single
     sensitiveReadConfirmations: single  # single | double
     gateShell: true

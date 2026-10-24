@@ -61,12 +61,12 @@ test('gateWrites risky lets an ordinary write through', async () => {
   assert.equal(result.kind, 'allow')
 })
 
-test('gateWrites risky still asks for a sensitive write', async () => {
+test('gateWrites risky still stops a sensitive write (now a config write)', async () => {
   const { ctx, listeners } = harness()
   apply(ctx, { gateWrites: 'risky' })
   const result = await run(listeners, 'write', { file_path: path.join(workspace, '.env'), content: 'A=1' })
-  assert.equal(result.kind, 'ask')
-  assert.match(result.displayReason.zh, /敏感文件/)
+  // No approval service here, so the high-risk path fails closed.
+  assert.equal(result.kind, 'deny')
 })
 
 test('gateWrites risky still asks for a sensitive read', async () => {
