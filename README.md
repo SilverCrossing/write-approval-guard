@@ -1,5 +1,7 @@
 # 写操作审批守卫（write-approval-guard）
 
+[English](README_EN.md) | 中文
+
 把「写文件」和「读敏感配置」变成必须经过人的动作：工作区内的写也要审批，破坏性或系统级操作要**两次**确认，读取 `.env`、`.config`、密钥之类的文件同样要审批。
 
 和 `outside-access-guard` 是正交的两层：那一层管「工作区之外」，这一层管「写」和「敏感读」。两者共存时的具体行为见「与 outside-access-guard 的联动」。
