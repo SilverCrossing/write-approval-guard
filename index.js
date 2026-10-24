@@ -226,6 +226,8 @@ async function confirmHighRisk(ctx, exec, decision, config) {
 
 function withSecondStep(decision) {
   return {
+    kind: decision.kind,
+    risk: decision.risk,
     reason: decision.reason,
     displayReason: {
       en: `Step 2 of 2 — ordinary approval. ${decision.displayReason.en}`,
