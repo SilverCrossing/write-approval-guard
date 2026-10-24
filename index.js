@@ -29,6 +29,7 @@ import {
   classifyToolCall,
   DEFAULT_SENSITIVE_PATTERNS,
 } from './classify.js'
+import { createLogger } from './log.js'
 
 export const name = 'write-approval-guard'
 
@@ -93,6 +94,9 @@ function normalizeConfig(raw) {
   }
   return {
     mode,
+    log: config.log !== false,
+    logDir: typeof config.logDir === 'string' ? config.logDir.trim() : '',
+    logRetentionDays: Number.isFinite(config.logRetentionDays) ? config.logRetentionDays : 7,
     onReject,
     unknownTools,
     gateWrites,
@@ -296,10 +300,12 @@ function registerCommand(ctx, config, getMode, setMode) {
 
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
+  const logger = createLogger('write-approval-guard', config)
   let mode = config.mode
 
   registerCommand(ctx, config, () => mode, value => {
     mode = value
+    logger.write({ event: 'mode', mode: value })
   })
 
   ctx.on('tools/pre-execute', async (exec, next) => {
@@ -332,12 +338,16 @@ export function apply(ctx, rawConfig) {
     // `gateWrites: "risky"` trades per-write approval for attention: ordinary
     // writes pass, only system/destructive/sensitive decisions stop here.
     if (config.gateWrites === 'risky' && (decision.kind === 'write' || decision.kind === 'shell-write')) {
+      logger.write({ event: 'allow', tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'risky', agent: exec.agent?.id })
       return next()
     }
 
     if (decision.risk === 'high' && config.highRiskConfirmations === 'double') {
       const first = await confirmHighRisk(ctx, exec, decision, config)
-      if (first !== null) return first
+      if (first !== null) {
+        logger.write({ event: first.kind === 'cancel' ? 'cancel' : 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'high-risk-step1', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
+        return first
+      }
       decision = withSecondStep(decision)
     }
 
@@ -345,14 +355,25 @@ export function apply(ctx, rawConfig) {
     // approval itself instead of delegating it to the runtime.
     if (config.onReject === 'turn') {
       const outcome = await requestDecision(ctx, exec, decision)
-      if (outcome.allowed === true) return next()
-      if (outcome.cancelled === true) return { kind: 'cancel' }
-      if (outcome.rejected === true) return rejectionDecision(exec, decision, 'approval-rejected', config)
+      if (outcome.allowed === true) {
+        logger.write({ event: 'allow', tool: exec.name, kind: decision.kind, risk: decision.risk, onReject: 'turn', agent: exec.agent?.id })
+        return next()
+      }
+      if (outcome.cancelled === true) {
+        logger.write({ event: 'cancel', tool: exec.name, kind: decision.kind, risk: decision.risk, agent: exec.agent?.id })
+        return { kind: 'cancel' }
+      }
+      if (outcome.rejected === true) {
+        logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'rejected', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
+        return rejectionDecision(exec, decision, 'approval-rejected', config)
+      }
+      logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: outcome.tag, agent: exec.agent?.id })
       return denyDecision(decision, outcome.tag)
     }
 
     if (exec.signal !== undefined && exec.signal.aborted) return { kind: 'cancel' }
 
+    logger.write({ event: 'ask', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
     return {
       kind: 'ask',
       reason: decision.reason,

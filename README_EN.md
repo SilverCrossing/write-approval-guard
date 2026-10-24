@@ -154,6 +154,9 @@ MIT licensed: fork and edit `WRITE_TOOL_PATHS` in `classify.js` — one `toolNam
 - id: write-approval-guard
   config:
     mode: enforce                  # enforce | off
+    log: true                      # append decision logs
+    logDir: ''                     # default <DSH_HOME>/logs/write-approval-guard
+    logRetentionDays: 7            # delete logs older than N days (0 = keep forever)
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
     gateWrites: all                # all | risky
@@ -210,6 +213,19 @@ The current bundle order is `outside-access-guard` → `prompt-persona-manager` 
 **Configuration trap**: this plugin's `sensitiveReadConfirmations: double` only applies inside the workspace (and to paths the outside layer lets through). A file already stopped by outside never reaches this plugin, so it does not get stricter — and nothing warns about it. To harden the outside case, change outside's sensitive list; note that its `sensitivePaths` **replaces** the defaults rather than appending to them.
 
 Measured (2026-10-23, Windows, `workspace-write`): `.env` and `.config` outside the workspace prompted once with "access outside the workspace"; `.env` inside prompted "reading a sensitive file".
+
+## Logging
+
+Every decision appends one JSONL line to `$DSH_HOME/logs/write-approval-guard/YYYY-MM-DD.log`, split by local date and kept for 7 days (cleaned on process start, then at most every six hours):
+
+```json
+{"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","reason":"..."}
+```
+
+- `event`: `ask` / `deny` / `cancel` / `allow` / `mode`;
+- only calls that were classified are logged (ordinary reads produce nothing);
+- a failed write only warns and never affects interception;
+- `log: false` disables it, `logDir` changes the directory, `logRetentionDays` changes retention.
 
 ## Known limitations
 

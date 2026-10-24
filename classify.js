@@ -438,12 +438,18 @@ function collectAbsoluteTokens(command) {
 /** The command word at the start of one pipeline segment. */
 function firstToken(segment) {
   let text = segment.trim()
-  if (text === '') return ''
-  text = text.replace(/^[&(]\s*/, '')
-  const assignment = /^[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+/.exec(text)
-  if (assignment !== null) text = text.slice(assignment[0].length)
-  const quoted = /^["']([^"']+)["']/.exec(text)
-  if (quoted !== null) return quoted[1].toLowerCase()
+  for (let guard = 0; guard < 4; guard += 1) {
+    if (text === '') return ''
+    text = text.replace(/^[&(]\s*/, '')
+    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+/.exec(text)
+    if (assignment !== null) text = text.slice(assignment[0].length)
+    const quoted = /^["']([^"']*)["']/.exec(text)
+    if (quoted === null) break
+    const rest = text.slice(quoted[0].length).trimStart()
+    // `"literal" + expression` is an expression, not a command word.
+    if (!rest.startsWith('+')) return quoted[1].toLowerCase()
+    text = rest.slice(1).trimStart()
+  }
   const match = /^(\S+)/.exec(text)
   return match === null ? '' : match[1].replace(/^["']|["']$/g, '').toLowerCase()
 }
@@ -453,9 +459,21 @@ function commandName(token) {
   return path.basename(trimmed).replace(/\.(?:exe|cmd|bat|com|ps1|sh)$/i, '').toLowerCase()
 }
 
+/** Git options that consume the next token, so it is not the subcommand (`-C <path>`). */
+const GIT_VALUE_OPTIONS = new Set(['-c', '-C', '--git-dir', '--work-tree', '--namespace', '--exec-path'])
+
 function gitVerdict(segment) {
-  const words = segment.trim().split(/\s+/).slice(1).filter(word => !word.startsWith('-'))
-  const subcommand = (words[0] ?? '').toLowerCase()
+  const words = segment.trim().split(/\s+/).slice(1)
+  let subcommand = ''
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index]
+    if (word.startsWith('-')) {
+      if (GIT_VALUE_OPTIONS.has(word)) index += 1
+      continue
+    }
+    subcommand = word.toLowerCase()
+    break
+  }
   if (subcommand === '') return 'read'
   if (GIT_READ_SUBCOMMANDS.has(subcommand)) return 'read'
   if (subcommand !== 'config') return 'write'
@@ -526,7 +544,13 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
         `高危：命令将修改系统位置（${systemTarget}），将执行：${short(text)}`,
       )
     }
-    if (CONFIG_TEXT.test(text)) {
+    const configHit = commandSegments(text).some(segment => {
+      if (!CONFIG_TEXT.test(segment)) return false
+      // Mentioning a path is not writing it: require a write verb or a redirect
+      // in the same segment.
+      return REDIRECT.test(segment) || segmentVerdict(segment, shellMode) === 'write'
+    })
+    if (configHit) {
       return decision(
         'config-write',
         'high',

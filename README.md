@@ -156,6 +156,9 @@
 - id: write-approval-guard
   config:
     mode: enforce                  # enforce | off
+    log: true                      # 记录拦截决定
+    logDir: ''                     # 默认 <DSH_HOME>/logs/write-approval-guard
+    logRetentionDays: 7            # 超过 N 天自动删除（0 = 永不删除）
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
     gateWrites: all                # all | risky
@@ -212,6 +215,19 @@
 **配置陷阱**：本插件的 `sensitiveReadConfirmations: double` 只作用于工作区内（以及 outside 层放行的路径）。工作区外已被 outside 层拦下的文件不会走到这里，所以不会跟着变严，也不会报错。要让外面也变严，得改 outside 的敏感清单——注意它的 `sensitivePaths` 是**覆盖**不是追加，写了就替换默认那一长串。
 
 实测记录（2026-10-23，Windows，`workspace-write`）：工作区外的 `.env`、`.config` 均只弹一次，文案为「访问工作区外」；工作区内的 `.env` 弹「读取敏感文件」。
+
+## 日志
+
+每次判定写一行 JSONL 到 `$DSH_HOME/logs/write-approval-guard/YYYY-MM-DD.log`，按本地日期分文件，默认保留 7 天（进程启动时清理一次，之后每 6 小时一次）：
+
+```json
+{"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","reason":"..."}
+```
+
+- `event`：`ask` / `deny` / `cancel` / `allow` / `mode`；
+- 只记录**被判定过**的调用（普通读取不会产生日志）；
+- 写日志失败只告警，不影响拦截；
+- `log: false` 关闭，`logDir` 换目录，`logRetentionDays` 改保留天数。
 
 ## 已知限制
 
