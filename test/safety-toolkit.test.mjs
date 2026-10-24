@@ -108,3 +108,30 @@ test('exempt paths still skip safe_write', () => {
     null,
   )
 })
+
+test('safe_rollback says it overwrites and names the snapshot', () => {
+  const decision = call('safe_rollback', { filepath: path.join(workspace, 'a.txt') })
+  assert.match(decision.displayReason.zh, /回滚会覆盖当前内容/)
+  assert.match(decision.displayReason.zh, /最近一次改动前快照/)
+})
+
+test('safe_rollback shows a named snapshot', () => {
+  const decision = call('safe_rollback', {
+    filepath: path.join(workspace, 'a.txt'),
+    backup_name: '20260101T000000000Z~edit.bak',
+  })
+  assert.match(decision.displayReason.zh, /20260101T000000000Z~edit\.bak/)
+})
+
+test('safe_rollback keeps the high-risk warning for system paths', () => {
+  const systemRoot = path.join(base, 'fakesys3')
+  fs.mkdirSync(systemRoot, { recursive: true })
+  const decision = call(
+    'safe_rollback',
+    { filepath: path.join(systemRoot, 'x.txt') },
+    { extraSystemRoots: [systemRoot] },
+  )
+  assert.equal(decision.risk, 'high')
+  assert.match(decision.displayReason.zh, /^高危：/)
+  assert.match(decision.displayReason.zh, /回滚会覆盖当前内容/)
+})

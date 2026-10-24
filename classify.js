@@ -557,6 +557,31 @@ function classifyWriteMany(tool, values, cwd, options) {
   }
 }
 
+/**
+ * `safe_rollback` writes an old snapshot over the current file. Say that
+ * explicitly and name the snapshot, because it can silently replace edits made
+ * after the snapshot was taken.
+ */
+function withRollbackNote(decision, args, value, cwd) {
+  const absolute = absoluteOf(value.trim(), cwd) ?? value.trim()
+  const named = typeof args.backup_name === 'string' && args.backup_name.trim() !== ''
+  const snapshot = named ? args.backup_name.trim().slice(0, 60) : null
+  const snapshotZh = snapshot ?? '最近一次改动前快照'
+  const snapshotEn = snapshot ?? 'the most recent pre-change snapshot'
+  const prefixZh = decision.risk === 'high' ? '高危：' : ''
+  const prefixEn = decision.risk === 'high' ? 'High risk: ' : ''
+  const sensitiveZh = decision.kind === 'sensitive-write' ? '（敏感文件）' : ''
+  const sensitiveEn = decision.kind === 'sensitive-write' ? ' (sensitive file)' : ''
+  return {
+    ...decision,
+    reason: `${prefixEn}Rollback will overwrite the current content: ${absolute} (snapshot: ${snapshotEn})${sensitiveEn}`,
+    displayReason: {
+      en: `${prefixEn}Rollback will overwrite the current content: ${absolute} (snapshot: ${snapshotEn})${sensitiveEn}`,
+      zh: `${prefixZh}回滚会覆盖当前内容：${absolute}（快照：${snapshotZh}）${sensitiveZh}`,
+    },
+  }
+}
+
 function classifyRead(tool, value, cwd, { sensitivePatterns }) {
   const target = value.trim()
   const absolute = absoluteOf(target, cwd)
@@ -632,7 +657,11 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
     if (args === null || typeof args !== 'object') return null
     const values = pathReader(args).filter(value => typeof value === 'string' && value.trim() !== '')
     if (values.length === 0) return null
-    return classifyWriteMany(name, values, cwd, { systemRoots, sensitivePatterns, exemptPaths })
+    const decision = classifyWriteMany(name, values, cwd, { systemRoots, sensitivePatterns, exemptPaths })
+    if (decision !== null && name === 'safe_rollback') {
+      return withRollbackNote(decision, args, values[0], cwd)
+    }
+    return decision
   }
 
   if (EXECUTION_WRITE_TOOLS.has(name)) {

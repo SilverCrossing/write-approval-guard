@@ -19,6 +19,22 @@
 
 两次都批准才执行；任一步拒绝都不会执行，取消则直接取消。批准结果是 `allowed-once`，不会出现「本次会话以后都允许」。
 
+## 降级模式：`gateWrites: risky`
+
+逐个审批普通写入，在长任务里会退化成“确认噪声”——前几次还看，后面只是点鼠标，真正危险的那次反而被淹没。`gateWrites: risky` 把门禁收窄到“人会认真看的那几类”：
+
+| 判定 | `all`（默认） | `risky` |
+| --- | --- | --- |
+| 普通写入（`write` / `safe_write` / `edit` / `safe_edit` / `multi_edit`） | 审批 | **放行** |
+| 普通命令行写（`Set-Content x.txt`、未知命令） | 审批 | **放行** |
+| 敏感文件读写（`.env`、`.config`、密钥） | 审批 | 审批 |
+| 系统路径写入 / 磁盘格式化 / 递归删除 / 权限修改 | 两次确认 | **两次确认** |
+| 未登记工具（`unknownTools: ask` 时） | 审批 | 审批 |
+
+也就是说：**只有“罕见且不可逆”的操作还会打断你**，普通重构不会。
+
+代价很明确：普通写不再有人把关，出问题只能靠快照回滚（配合 `dsh-safety-toolkit` 时每个文件都有备份）。这是拿“每次确认”换“确认的有效性”。
+
 ## 高危清单
 
 默认开启以下四类（`highRiskConfirmations: single` 可整体退化成单次）：
@@ -73,12 +89,14 @@
 | `write` / `edit` | 原生 | `file_path` |
 | `read` / `read_image` / `grep` / `glob` | 原生 | 敏感读判定 |
 | `pwsh` / `bash` / `shell` | 原生 | 命令文本启发式 |
-| `safe_write` / `safe_edit` / `safe_rollback` | [dsh-safety-toolkit](https://github.com/SilverCrossing/dsh-safety-toolkit) | `filepath` |
+| `safe_write` / `safe_edit` / `safe_rollback` | [dsh-safety-toolkit](https://github.com/SilverCrossing/dsh-safety-toolkit) | `filepath`；回滚的文案会说明「会覆盖当前内容」与目标快照 |
 | `multi_edit` | 同上 | `edits[].file`（逐项判定，取最高风险） |
 | `test_runner` | 同上 | 无路径，按"执行项目代码"单次审批 |
 | `syntax_check` / `safe_backups` | 同上 | 只读或只动备份元数据，不拦 |
 
 `dsh-safety-toolkit` 的 governance 会把 `write`/`edit` 从工具表里移除，所以那套 `safe_*` 名字必须单列——否则护栏会被"安全工具"整体绕过。
+
+另外，`safe_*` 系列由工具自身强制**工作区包含**：越界路径会在执行前被它拒绝（`路径越界`）。所以工作区外的写入仍然只能走原生 `write` + 沙箱一次性升级，审批通过也不代表能越界。
 
 ### 不会覆盖
 
@@ -121,6 +139,7 @@
     mode: enforce                  # enforce | off
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
+    gateWrites: all                # all | risky
     highRiskConfirmations: double  # double | single
     sensitiveReadConfirmations: single  # single | double
     gateShell: true

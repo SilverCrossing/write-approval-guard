@@ -87,10 +87,15 @@ function normalizeConfig(raw) {
   if (config.unknownTools !== undefined && !['allow', 'ask'].includes(config.unknownTools)) {
     warn('config.unknownTools must be "allow" or "ask"; keeping "allow"')
   }
+  const gateWrites = config.gateWrites === 'risky' ? 'risky' : 'all'
+  if (config.gateWrites !== undefined && !['all', 'risky'].includes(config.gateWrites)) {
+    warn('config.gateWrites must be "all" or "risky"; keeping "all"')
+  }
   return {
     mode,
     onReject,
     unknownTools,
+    gateWrites,
     highRiskConfirmations,
     sensitiveReadConfirmations,
     gateShell: config.gateShell !== false,
@@ -237,6 +242,7 @@ function statusText(mode, config) {
   const high = config.highRiskConfirmations === 'double' ? '两次确认' : '仅一次确认'
   return [
     `写操作审批：${mode === 'enforce' ? '启用' : '已关闭'}（配置默认：${config.mode}）`,
+    `写入门禁：${config.gateWrites === 'risky' ? '仅高风险' : '全部写入'}`,
     `拒绝行为：${config.onReject === 'turn' ? '拒绝并停止本轮' : '仅拒绝本次调用'}`,
     `未登记工具：${config.unknownTools === 'ask' ? '审批' : '放行'}`,
     `高危操作：${high}`,
@@ -321,6 +327,12 @@ export function apply(ctx, rawConfig) {
     }
 
     if (decision === null) return next()
+
+    // `gateWrites: "risky"` trades per-write approval for attention: ordinary
+    // writes pass, only system/destructive/sensitive decisions stop here.
+    if (config.gateWrites === 'risky' && (decision.kind === 'write' || decision.kind === 'shell-write')) {
+      return next()
+    }
 
     if (decision.risk === 'high' && config.highRiskConfirmations === 'double') {
       const first = await confirmHighRisk(ctx, exec, decision, config)
