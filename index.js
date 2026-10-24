@@ -44,6 +44,11 @@ function warn(message) {
   console.warn(`[write-approval-guard] ${message}`)
 }
 
+/** Promise-based delay used by the confirmation gap. */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 /** Read a list of non-empty strings, warning instead of silently falling back. */
 function stringList(value, key, fallback) {
   if (value === undefined) return [...fallback]
@@ -97,6 +102,7 @@ function normalizeConfig(raw) {
     log: config.log !== false,
     logDir: typeof config.logDir === 'string' ? config.logDir.trim() : '',
     logRetentionDays: Number.isFinite(config.logRetentionDays) ? config.logRetentionDays : 7,
+    confirmGapMs: Number.isFinite(config.confirmGapMs) && config.confirmGapMs >= 0 ? Math.floor(config.confirmGapMs) : 2000,
     onReject,
     unknownTools,
     gateWrites,
@@ -214,8 +220,8 @@ async function confirmHighRisk(ctx, exec, decision, config) {
   const outcome = await requestDecision(ctx, exec, decision, {
     reason: `High-risk file operation (confirmation 1/2): ${decision.reason}`,
     displayReason: {
-      en: `Step 1 of 2 — high-risk file operation. ${decision.displayReason.en} Approving here only opens the ordinary approval for this single call.`,
-      zh: `第 1/2 次确认——高危文件操作。${decision.displayReason.zh}此处批准只会再弹出这一次调用的常规审批，两次都批准才会执行。`,
+      en: `Step 1 of 2 — open the final confirmation. ${decision.displayReason.en} Nothing runs here: approving only opens the second dialog.`,
+      zh: `第 1/2 次确认——开启最终确认。${decision.displayReason.zh}此处不会执行：批准后会停顿，再弹出第 2 次确认。`,
     },
   })
   if (outcome.allowed === true) return null
@@ -224,14 +230,20 @@ async function confirmHighRisk(ctx, exec, decision, config) {
   return denyDecision(decision, outcome.tag)
 }
 
+/**
+ * Re-label a decision as the ordinary (second) confirmation.
+ *
+ * `kind` and `risk` must survive: the decision log records them, and dropping
+ * them here made the second step show up as `unknown`/`normal` in older builds.
+ */
 function withSecondStep(decision) {
   return {
     kind: decision.kind,
     risk: decision.risk,
     reason: decision.reason,
     displayReason: {
-      en: `Step 2 of 2 — ordinary approval. ${decision.displayReason.en}`,
-      zh: `第 2/2 次确认——常规审批。${decision.displayReason.zh}`,
+      en: `Step 2 of 2 — final high-risk confirmation. ${decision.displayReason.en} The call runs immediately after approval.`,
+      zh: `第 2/2 次确认——高危操作，最终确认。${decision.displayReason.zh}批准后将立即执行。`,
     },
   }
 }
@@ -306,6 +318,11 @@ export function apply(ctx, rawConfig) {
   const pending = new Map()
   const MAX_PENDING = 256
 
+  /**
+   * Remember which call this plugin asked about, so the approval outcome can
+   * be attached to it later. Bounded: a call whose approval never arrives (or
+   * whose process was restarted) is dropped instead of leaking memory.
+   */
   function rememberAsk(exec, decision) {
     if (exec.callId === undefined) return
     if (pending.size >= MAX_PENDING) {
@@ -337,6 +354,10 @@ export function apply(ctx, rawConfig) {
     logger.write({ event: 'mode', mode: value })
   })
 
+  // Pipeline for one call:
+  //   classify → (risky mode: pass ordinary writes) → high-risk step 1/2
+  //   → (turn mode: ask here) or (call mode: hand `ask` to the runtime)
+  // Every branch that stops the call writes one decision log line first.
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (mode === 'off') return next()
     if (exec === null || typeof exec !== 'object' || typeof exec.name !== 'string') return next()
@@ -380,6 +401,12 @@ export function apply(ctx, rawConfig) {
         return first
       }
       decision = withSecondStep(decision)
+      // A mandatory pause before the second dialog: it turns a reflex double
+      // click into a decision, without changing either dialog's wording.
+      if (config.confirmGapMs > 0) {
+        await sleep(config.confirmGapMs)
+        if (exec.signal !== undefined && exec.signal.aborted) return { kind: 'cancel' }
+      }
     }
 
     // `onReject: "turn"` needs the outcome, so this plugin asks the ordinary

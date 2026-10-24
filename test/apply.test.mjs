@@ -137,7 +137,7 @@ test('a high-risk call falls through to the ordinary approval when step 1 passes
     },
   }
   const { ctx, listeners } = harness({ approval })
-  apply(ctx, {})
+  apply(ctx, { confirmGapMs: 0 })
   const result = await preExecute(listeners, exec('pwsh', { command: 'rm -rf ./build' }))
   assert.equal(calls.length, 1)
   assert.equal(result.kind, 'ask')
@@ -185,7 +185,7 @@ test('sensitiveReadConfirmations double confirms a .env read twice', async () =>
     },
   }
   const { ctx, listeners } = harness({ approval })
-  apply(ctx, { sensitiveReadConfirmations: 'double' })
+  apply(ctx, { sensitiveReadConfirmations: 'double', confirmGapMs: 0 })
   const result = await preExecute(listeners, exec('read', { file_path: path.join(workspace, '.env') }))
   assert.equal(calls.length, 1)
   assert.equal(result.kind, 'ask')
@@ -214,4 +214,14 @@ test('a missing commands service does not break the gate', async () => {
   apply(ctx, {})
   const result = await preExecute(listeners, exec('write', { file_path: path.join(workspace, 'new.txt') }))
   assert.equal(result.kind, 'ask')
+})
+
+test('the confirmation gap delays the second dialog', async () => {
+  const approval = { async request() { return 'allowed-once' } }
+  const { ctx, listeners } = harness({ approval })
+  apply(ctx, { confirmGapMs: 60 })
+  const started = Date.now()
+  const result = await preExecute(listeners, exec('write', { file_path: path.join(workspace, '.env') }))
+  assert.equal(result.kind, 'ask')
+  assert.ok(Date.now() - started >= 50, 'the second dialog should wait for the configured gap')
 })

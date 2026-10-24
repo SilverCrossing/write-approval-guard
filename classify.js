@@ -8,6 +8,16 @@
  *
  * Deliberately dependency-free (node:fs + node:path only) so the rules can be
  * unit tested outside the Harness process.
+ *
+ * Layout, top to bottom:
+ *   1. tool tables       — which tool writes or reads which argument
+ *   2. sensitive tables  — credential locations and file names
+ *   3. config tables     — configuration and behavior files
+ *   4. high-risk tables  — destructive shell patterns and their labels
+ *   5. path helpers      — containment, realpath, glob matching
+ *   6. decision shape    — the { kind, risk, reason, displayReason } contract
+ *   7. command parsing   — tokenisation, git/sed special cases, shell verdicts
+ *   8. classifiers       — classifyShell / classifyToolCall, the entry points
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -419,6 +429,16 @@ function short(value, max = 280) {
   return text.length > max ? `${text.slice(0, max)}…` : text
 }
 
+/**
+ * The object every classifier returns.
+ *
+ *   kind   what the call does: `write`, `shell-write`, `config-write`,
+ *          `sensitive-read`, or `unclassified` when classification failed;
+ *   risk   `normal` or `high`; `high` activates the second confirmation;
+ *   reason one English line naming the path or command; shown in the dialog
+ *          and written to the decision log;
+ *   displayReason the same text in every locale.
+ */
 function decision(kind, risk, en, zh) {
   return { kind, risk, reason: en, displayReason: { en, zh } }
 }
@@ -454,6 +474,7 @@ function firstToken(segment) {
   return match === null ? '' : match[1].replace(/^["']|["']$/g, '').toLowerCase()
 }
 
+/** Drop the directory and a script suffix: `C:\\Program Files\\x\\Git.EXE` → `git`. */
 function commandName(token) {
   const trimmed = token.replace(/[\\/]+$/, '')
   return path.basename(trimmed).replace(/\.(?:exe|cmd|bat|com|ps1|sh)$/i, '').toLowerCase()
@@ -477,6 +498,7 @@ function gitVerdict(segment) {
   if (subcommand === '') return 'read'
   if (GIT_READ_SUBCOMMANDS.has(subcommand)) return 'read'
   if (subcommand !== 'config') return 'write'
+  // `git config --get <key>` only reads; every other config call may write.
   return segment.includes('--get') ? 'read' : 'write'
 }
 
@@ -490,11 +512,13 @@ function segmentVerdict(segment, shellMode) {
   const name = commandName(token)
   if (READ_ONLY_COMMANDS.has(name)) return 'read'
   if (name === 'git') return gitVerdict(segment)
+  // `sed -i` / `perl -i` edit files in place; without the flag they only read.
   if (name === 'sed' || name === 'perl') return /(?:^|\s)-\w*i/.test(segment) ? 'write' : 'read'
   if (WRITE_COMMANDS.has(name)) return 'write'
   return shellMode === 'lenient' ? 'read' : 'write'
 }
 
+/** Split on newlines and the shell operators `;`, `&&`, `||` and `|`. */
 function commandSegments(command) {
   return command
     .split(/\r?\n|;|&&|\|\||\|/)
@@ -502,6 +526,7 @@ function commandSegments(command) {
     .filter(segment => segment !== '')
 }
 
+/** First pattern that matches, in HIGH_RISK_PATTERNS order, or null. */
 function matchHighRisk(command) {
   for (const [id, regex] of HIGH_RISK_PATTERNS) {
     const match = regex.exec(command)

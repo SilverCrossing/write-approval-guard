@@ -14,8 +14,9 @@ It is orthogonal to `outside-access-guard`: that layer owns "outside the workspa
 
 The two confirmations for a high-risk call are:
 
-1. **Step 1/2** — a dedicated `approval.request` that names the risk and the matched rule;
-2. **Step 2/2** — the ordinary approval for this call (`kind: 'ask'`).
+1. **Step 1/2** — a dedicated `approval.request` that only opens the final confirmation; nothing runs here;
+2. **Gap** — a mandatory `confirmGapMs` pause (2000 ms by default) between the two dialogs, so a reflex double click does not work;
+3. **Step 2/2** — the ordinary approval for this call (`kind: 'ask'`); **the high-risk warning lives here**, because the paused dialog is the one that actually gets read.
 
 Both must be approved; rejecting either step means nothing runs, and cancelling cancels the call. The only grant is `allowed-once` — there is no "allow for the rest of this session".
 
@@ -157,6 +158,7 @@ MIT licensed: fork and edit `WRITE_TOOL_PATHS` in `classify.js` — one `toolNam
     log: true                      # append decision logs
     logDir: ''                     # default <DSH_HOME>/logs/write-approval-guard
     logRetentionDays: 7            # delete logs older than N days (0 = keep forever)
+    confirmGapMs: 2000             # mandatory pause between the two confirmations (0 = off)
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
     gateWrites: all                # all | risky

@@ -16,8 +16,9 @@
 
 高危的两次确认是：
 
-1. **第 1/2 次**：单独的 `approval.request`，文案里说明风险点和命中的规则；
-2. **第 2/2 次**：这次调用的常规审批（`kind: 'ask'`）。
+1. **第 1/2 次**：单独的 `approval.request`，只负责"开启最终确认"，本身不执行任何操作；
+2. **停顿**：两次之间强制等待 `confirmGapMs`（默认 2000 毫秒），避免连点掠过；
+3. **第 2/2 次**：这次调用的常规审批（`kind: 'ask'`）——**高危警告文案放在这一层**，因为带停顿的这次才会被真正注意到。
 
 两次都批准才执行；任一步拒绝都不会执行，取消则直接取消。批准结果是 `allowed-once`，不会出现「本次会话以后都允许」。
 
@@ -159,6 +160,7 @@
     log: true                      # 记录拦截决定
     logDir: ''                     # 默认 <DSH_HOME>/logs/write-approval-guard
     logRetentionDays: 7            # 超过 N 天自动删除（0 = 永不删除）
+    confirmGapMs: 2000             # 二次确认之间的强制停顿（毫秒，0 = 关闭）
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
     gateWrites: all                # all | risky
