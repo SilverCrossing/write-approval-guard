@@ -221,7 +221,7 @@
 每次判定写一行 JSONL 到 `$DSH_HOME/logs/write-approval-guard/YYYY-MM-DD.log`，按本地日期分文件，默认保留 7 天（进程启动时清理一次，之后每 6 小时一次）：
 
 ```json
-{"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","reason":"..."}
+{"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","callId":"...","reason":"..."}
 ```
 
 - `event`：`ask` / `deny` / `cancel` / `allow` / `mode` / `approval`（审批结果：allowed-once / rejected / cancelled / unavailable）；

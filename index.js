@@ -322,7 +322,7 @@ export function apply(ctx, rawConfig) {
       const known = request.callId !== undefined ? pending.get(request.callId) : undefined
       if (known !== undefined) {
         pending.delete(request.callId)
-        logger.write({ event: 'approval', outcome, tool: known.tool, kind: known.kind, risk: known.risk, agent: request.agent?.id })
+        logger.write({ event: 'approval', outcome, tool: known.tool, kind: known.kind, risk: known.risk, agent: request.agent?.id, callId: request.callId })
       }
     } catch {
       // Logging must never change the approval outcome.
@@ -367,16 +367,16 @@ export function apply(ctx, rawConfig) {
     // `gateWrites: "risky"` trades per-write approval for attention: ordinary
     // writes pass, only system/destructive/sensitive decisions stop here.
     if (config.gateWrites === 'risky' && (decision.kind === 'write' || decision.kind === 'shell-write')) {
-      logger.write({ event: 'allow', tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'risky', agent: exec.agent?.id })
+      logger.write({ event: 'allow', tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'risky', agent: exec.agent?.id, callId: exec.callId })
       return next()
     }
 
     if (decision.risk === 'high' && config.highRiskConfirmations === 'double') {
       rememberAsk(exec, decision)
-      logger.write({ event: 'ask', rule: 'high-risk-step1', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
+      logger.write({ event: 'ask', rule: 'high-risk-step1', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
       const first = await confirmHighRisk(ctx, exec, decision, config)
       if (first !== null) {
-        logger.write({ event: first.kind === 'cancel' ? 'cancel' : 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'high-risk-step1', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
+        logger.write({ event: first.kind === 'cancel' ? 'cancel' : 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'high-risk-step1', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
         return first
       }
       decision = withSecondStep(decision)
@@ -388,25 +388,25 @@ export function apply(ctx, rawConfig) {
       rememberAsk(exec, decision)
       const outcome = await requestDecision(ctx, exec, decision)
       if (outcome.allowed === true) {
-        logger.write({ event: 'allow', tool: exec.name, kind: decision.kind, risk: decision.risk, onReject: 'turn', agent: exec.agent?.id })
+        logger.write({ event: 'allow', tool: exec.name, kind: decision.kind, risk: decision.risk, onReject: 'turn', agent: exec.agent?.id, callId: exec.callId })
         return next()
       }
       if (outcome.cancelled === true) {
-        logger.write({ event: 'cancel', tool: exec.name, kind: decision.kind, risk: decision.risk, agent: exec.agent?.id })
+        logger.write({ event: 'cancel', tool: exec.name, kind: decision.kind, risk: decision.risk, agent: exec.agent?.id, callId: exec.callId })
         return { kind: 'cancel' }
       }
       if (outcome.rejected === true) {
-        logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'rejected', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
+        logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'rejected', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
         return rejectionDecision(exec, decision, 'approval-rejected', config)
       }
-      logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: outcome.tag, agent: exec.agent?.id })
+      logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: outcome.tag, agent: exec.agent?.id, callId: exec.callId })
       return denyDecision(decision, outcome.tag)
     }
 
     if (exec.signal !== undefined && exec.signal.aborted) return { kind: 'cancel' }
 
     rememberAsk(exec, decision)
-    logger.write({ event: 'ask', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id })
+    logger.write({ event: 'ask', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
     return {
       kind: 'ask',
       reason: decision.reason,

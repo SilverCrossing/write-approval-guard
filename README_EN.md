@@ -219,7 +219,7 @@ Measured (2026-10-23, Windows, `workspace-write`): `.env` and `.config` outside 
 Every decision appends one JSONL line to `$DSH_HOME/logs/write-approval-guard/YYYY-MM-DD.log`, split by local date and kept for 7 days (cleaned on process start, then at most every six hours):
 
 ```json
-{"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","reason":"..."}
+{"ts":"2026-10-24T20:38:35.123+08:00","event":"ask","tool":"pwsh","kind":"destructive","risk":"high","gateWrites":"all","agent":"...","callId":"...","reason":"..."}
 ```
 
 - `event`: `ask` / `deny` / `cancel` / `allow` / `mode` / `approval` (the outcome: allowed-once / rejected / cancelled / unavailable);
