@@ -1,0 +1,35 @@
+{
+  "name": "write-approval-guard",
+  "version": "0.3.0",
+  "private": true,
+  "license": "MIT",
+  "author": "SilverCrossing",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SilverCrossing/write-approval-guard.git"
+  },
+  "type": "module",
+  "description": "Per-write or risky-only approval for file writes, a second confirmation for system paths, configuration and behavior files, and destructive commands, and approval before reading secret-bearing files.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "classify.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.0"
+  }
+}

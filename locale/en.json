@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Write Approval Guard",
+    "description": "Per-write or risky-only approval for file writes; system paths, configuration and behavior files, and destructive commands need a second confirmation, and secret-bearing files need approval to read."
+  }
+}
