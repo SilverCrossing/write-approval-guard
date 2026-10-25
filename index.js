@@ -131,9 +131,12 @@ async function sessionCwd(ctx, exec) {
 }
 
 /**
- * Cooperative stop of the current turn: `agent.cancel()` aborts the current
- * activity, clears pending work, and keeps already delivered stream text. It
- * does not kill a process or discard the session.
+ * Cooperative stop of the current turn: `agent.cancel({ kind: 'user' })` aborts
+ * the current activity, clears pending work, and keeps already delivered stream
+ * text. It does not kill a process or discard the session.
+ *
+ * 中文：协作式停止本轮。cancel 必须带 cause（这里是 user，语义等于“用户自己
+ * 按了停止”），运行时会把它记进 turn/end；不带 cause 会触发内部断言。
  */
 function stopTurn(exec) {
   const agent = exec.agent
@@ -142,7 +145,12 @@ function stopTurn(exec) {
     return false
   }
   try {
-    agent.cancel()
+    // `cancel` takes a required cause: the loop copies it into `turn/end` and
+    // asserts on anything outside that closed union, so a bare call turns a
+    // user stop into an internal failure instead of a recorded abort.
+    // 中文：cancel 必须带 cause，运行时会把它复制进 turn/end，并用断言检查
+    // 取值是否在合法集合内；不带 cause 会把“用户停止”变成内部错误。
+    agent.cancel({ kind: 'user' })
     return true
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

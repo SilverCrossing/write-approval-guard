@@ -45,14 +45,17 @@ function execution(name, args, agent) {
 }
 
 function fakeAgent() {
-  let cancels = 0
+  const causes = []
   return {
     id: 'agent-test',
-    cancel() {
-      cancels += 1
+    cancel(cause) {
+      causes.push(cause)
     },
     cancels() {
-      return cancels
+      return causes.length
+    },
+    causes() {
+      return causes
     },
   }
 }
@@ -123,6 +126,10 @@ test('onReject turn cancels the turn and says so', async () => {
 
   assert.equal(approval.calls.length, 1)
   assert.equal(agent.cancels(), 1)
+  // The loop requires a cause and copies it into `turn/end`; a bare cancel()
+  // trips its internal assertion.
+  // 中文：运行时要求 cancel 必须带 cause 并会写进 turn/end，不带会触发断言。
+  assert.deepEqual(agent.causes(), [{ kind: 'user' }])
   assert.equal(result.kind, 'deny')
   assert.match(result.reason, /stopped the current turn/)
   assert.match(result.info.reason, /停止了本轮/)
