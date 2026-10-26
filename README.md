@@ -6,6 +6,21 @@
 
 和 `outside-access-guard` 是正交的两层：那一层管「工作区之外」，这一层管「写」和「敏感读」。两者共存时的具体行为见「与 outside-access-guard 的联动」。
 
+## 设计权衡：子代理没有审批通道
+
+> 这不是 bug，是设计上的取舍。
+
+子代理（`subagent`、`workflow` 里的 `agent()`）是独立会话，**没有绑定审批答复者**。所以它发起的写操作、越界访问、高危操作一律 **fail closed**：
+
+- 不会弹窗到任何地方；
+- 不会挂起等待，而是立即被拒绝；
+- 模型收到的文案是 `the user rejected tool "…"`，看起来像人拒绝，实际是“没有可用的审批通道”；
+- 这类调用在日志里只有 `ask`、没有 `approval` 结果行——旁听瀑布根本没被调到。
+
+为什么这么设计：审批的前提是“有人看见”。给子代理一条无人确认就能放行的通道，等于在这条链上开了个洞；而“自动批准”比“自动拒绝”危险得多。宁可让子代理只读，也不做这个让步。
+
+**影响**：委派写任务必然失败；子代理适合读文件、跑只读命令、做分析。真正要落地的修改，只能由有 UI 会话的 agent 完成——它的每一步都要你点。需要子代理产出改动时，让父会话代跑。
+
 ## 三类判定
 
 | 判定 | 触发条件 | 确认次数 |
@@ -40,7 +55,7 @@
 
 ## 高危清单
 
-默认开启以下四类（`highRiskConfirmations: single` 可整体退化成单次）：
+默认开启以下六类（`highRiskConfirmations: single` 可整体退化成单次）：
 
 | 类别 | 例子 |
 | --- | --- |
@@ -48,6 +63,8 @@
 | 递归/通配删除 | `Remove-Item -Recurse`、`Remove-Item *`、`rm -rf`、`rd /s`、`del /f /s`、`del *.*` |
 | 系统配置/系统目录 | `reg add|delete`、`Set-ItemProperty HKLM:`、`sc config|delete`、`Set-Service`、`bcdedit`、`netsh`、`shutdown`、`schtasks /create`、`setx`、`Set-ExecutionPolicy`、写 `C:\Windows`、`C:\Program Files`、`/etc`、`/usr` |
 | 权限/所有权 | `icacls /reset|grant`、`cacls`、`takeown /f`、`chmod -R`、`chown -R`、`chmod 777` |
+| 下载即执行 | `iwr … \| iex`、`curl … \| bash`、`iex (…DownloadString…)`——你只能看到 URL，看不到载荷 |
+| 自主性工具 | `schedule_create`、`schedule_update`、`create_goal`、`update_goal`（`edit` / `resume`）——会在你离开后继续工作 |
 
 破坏性 Git（`reset --hard`、`clean -xdf`）和包管理器写入**不算**高危，只走单次审批；这是按使用者的选择定的，避免日常疲劳。
 

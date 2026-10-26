@@ -46,6 +46,37 @@ const WRITE_TOOL_PATHS = Object.freeze({
 /** Tools that run project code but declare no file path. */
 const EXECUTION_WRITE_TOOLS = new Set(['test_runner'])
 
+/**
+ * Tools that hand the agent autonomy instead of performing one action: they
+ * schedule work for later or open automatic continuation rounds, so they keep
+ * working while the user is away. Autonomy is the most destructive capability
+ * in the set, so these take the second confirmation.
+ *
+ * 中文：这些不是“一次操作”，而是“把控制权交出去”——定时任务会在你离开后
+ * 触发，目标会开启自动续轮。它们比单条命令破坏性更强，所以归为高危。
+ */
+const AUTONOMY_TOOLS = new Set(['schedule_create', 'schedule_update', 'create_goal'])
+
+/**
+ * `update_goal` only grants autonomy through `edit` (new objective or a higher
+ * round cap) and `resume` (re-arm a paused goal). Completing, pausing or
+ * blocking a goal reduces autonomy and stays ungated.
+ */
+const AUTONOMY_GOAL_ACTIONS = new Set(['edit', 'resume'])
+
+/** One-line summary of what an autonomy tool will start or schedule. */
+function autonomySummary(name, args) {
+  const text = key => args !== null && typeof args === 'object' && typeof args[key] === 'string' ? args[key] : ''
+  if (name === 'create_goal' || name === 'update_goal') return short(text('objective'))
+  const at = args !== null && typeof args === 'object' ? args.at : undefined
+  const timing = typeof at === 'string'
+    ? at
+    : at !== null && typeof at === 'object'
+      ? [at.date, at.time, at.time_zone].filter(part => typeof part === 'string' && part !== '').join(' ')
+      : ''
+  return timing === '' ? short(text('prompt')) : `${short(text('prompt'))} @ ${short(timing, 60)}`
+}
+
 /** Tools whose path argument is read. */
 const READ_TOOLS = Object.freeze({ read: 'file_path', read_image: 'file_path' })
 
@@ -219,6 +250,7 @@ const HIGH_RISK_LABELS = Object.freeze({
   delete: '递归或通配删除 (recursive or wildcard delete)',
   system: '系统配置修改 (system configuration)',
   perm: '权限/所有权修改 (permissions or ownership)',
+  download: '下载并直接执行 (download and execute)',
 })
 
 /**
@@ -256,6 +288,9 @@ const HIGH_RISK_PATTERNS = Object.freeze([
   ['perm', /\btakeown(?:\.exe)?\b[^\n]*\/f\b/i],
   ['perm', /\b(?:chmod|chown|chgrp)\b[^\n]*\s-R\b/i],
   ['perm', /\b(?:chmod|chown)\b[^\n]*\b(?:777|000|4755)\b/i],
+  // Download-and-execute in one line: the user sees a URL, not the payload.
+  ['download', /\b(?:curl|wget|invoke-webrequest|iwr|irm|invoke-restmethod)\b[^\n]*\|\s*(?:iex|invoke-expression|bash|sh|zsh|pwsh|powershell)\b/i],
+  ['download', /\b(?:iex|invoke-expression)\b[\s\S]*\b(?:downloadstring|downloadfile|invoke-webrequest|iwr|irm)\b/i],
 ])
 
 /** Commands that only read, so a plain invocation needs no approval. */
@@ -271,6 +306,16 @@ const READ_ONLY_COMMANDS = new Set([
   'systeminfo', 'ver', 'where', 'which', 'echo', 'write-output', 'write-host',
   'out-null', 'get-date', 'date', 'printenv', 'env', 'tree', 'wc', 'du', 'df',
   'stat', 'file', 'cmp', 'diff', 'comm', 'basename', 'dirname', 'realpath',
+  // Read-only cmdlets that were missing: registry and property reads, display
+  // writers, JSON/CSV conversion, and sleep/progress helpers. Without these,
+  // every `Get-ItemProperty` or `Out-String` turned a read into "may write".
+  'out-string', 'out-host', 'convertfrom-json', 'convertfrom-csv',
+  'get-itemproperty', 'get-itempropertyvalue', 'get-member', 'get-unique',
+  'compare-object', 'format-wide', 'format-custom', 'measure-command',
+  'start-sleep', 'get-psdrive', 'get-volume', 'get-acl',
+  'write-progress', 'write-verbose', 'write-information', 'get-history',
+  'test-connection', 'resolve-dnsname', 'get-ciminstance', 'get-wmiobject',
+  'get-eventlog', 'get-winevent',
 ])
 
 /** Commands that write, so a plain invocation needs one approval. */
@@ -433,7 +478,8 @@ function short(value, max = 280) {
  * The object every classifier returns.
  *
  *   kind   what the call does: `write`, `shell-write`, `config-write`,
- *          `sensitive-read`, or `unclassified` when classification failed;
+ *          `deferred-action`, `sensitive-read`, or `unclassified` when
+ *          classification failed;
  *   risk   `normal` or `high`; `high` activates the second confirmation;
  *   reason one English line naming the path or command; shown in the dialog
  *          and written to the decision log;
@@ -497,33 +543,346 @@ function gitVerdict(segment) {
   }
   if (subcommand === '') return 'read'
   if (GIT_READ_SUBCOMMANDS.has(subcommand)) return 'read'
+  // `git remote -v` / `git remote show` only read; add/remove/set-url/prune write.
+  if (subcommand === 'remote') return /(?:^|\s)(?:-v|--verbose|show)\b/.test(segment) ? 'read' : 'write'
   if (subcommand !== 'config') return 'write'
   // `git config --get <key>` only reads; every other config call may write.
   return segment.includes('--get') ? 'read' : 'write'
 }
 
+/** Shell containers whose body runs (or is scanned) as commands of its own. */
+const CONTAINER_COMMANDS = new Set([
+  'if', 'elseif', 'else', 'foreach', 'for', 'while', 'do', 'until', 'switch',
+  'try', 'catch', 'finally', 'function', 'filter', 'begin', 'process', 'end',
+])
+
+/**
+ * Cmdlets whose `{ … }` is a statement block: the block decides the verdict.
+ * `select-object` / `sort-object` stay out on purpose — their `{ … }` is a
+ * property expression (often `@{n=…;e={…}}`), not a place to run commands.
+ */
+const BLOCK_COMMANDS = new Set(['foreach-object', 'where-object'])
+
+/** PowerShell aliases that name a block cmdlet. */
+const BLOCK_ALIASES = new Map([['%', 'foreach-object'], ['?', 'where-object']])
+
+/** Top-level `{ … }` bodies of one segment, in source order. */
+function blockBodies(segment) {
+  const bodies = []
+  let depth = 0
+  let start = -1
+  let quote = ''
+  for (let index = 0; index < segment.length; index += 1) {
+    const char = segment[index]
+    if (quote !== '') {
+      if (char === '`') { index += 1; continue }
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === "'" || char === '"') { quote = char; continue }
+    if (char === '{') {
+      if (depth === 0) start = index + 1
+      depth += 1
+      continue
+    }
+    if (char === '}') {
+      depth = Math.max(0, depth - 1)
+      if (depth === 0 && start >= 0) {
+        bodies.push(segment.slice(start, index))
+        start = -1
+      }
+    }
+  }
+  return bodies
+}
+
+/**
+ * Split on newlines and the shell operators `;`, `&&`, `||` and `|`, but only
+ * at the top level: a separator inside quotes, `( … )`, `[ … ]` or `{ … }`
+ * belongs to the expression it sits in. Splitting inside a block used to turn
+ * `foreach`, bare strings and assignments into fake commands.
+ */
+function commandSegments(command) {
+  const segments = []
+  let buffer = ''
+  let quote = ''
+  let depth = 0
+  const flush = () => {
+    const trimmed = buffer.trim()
+    if (trimmed !== '') segments.push(trimmed)
+    buffer = ''
+  }
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (quote !== '') {
+      buffer += char
+      if (char === '`' && quote === '"') { buffer += command[index + 1] ?? ''; index += 1; continue }
+      if (char === quote) quote = ''
+      continue
+    }
+    // Here-string: skip to its closing marker so its body is never parsed.
+    if (char === '@' && (command[index + 1] === "'" || command[index + 1] === '"')) {
+      const closer = command[index + 1] === "'" ? "'@" : '"@'
+      const end = command.indexOf(`\n${closer}`, index + 2)
+      const stop = end === -1 ? command.length : end + 3
+      buffer += command.slice(index, stop)
+      index = stop - 1
+      continue
+    }
+    if (char === "'" || char === '"') { quote = char; buffer += char; continue }
+    if (char === '`') { buffer += char + (command[index + 1] ?? ''); index += 1; continue }
+    if (char === '(' || char === '[' || char === '{') { depth += 1; buffer += char; continue }
+    if (char === ')' || char === ']' || char === '}') { depth = Math.max(0, depth - 1); buffer += char; continue }
+    if (depth === 0 && (char === ';' || char === '\n')) { flush(); continue }
+    if (depth === 0 && char === '|') { flush(); if (command[index + 1] === '|') index += 1; continue }
+    if (depth === 0 && char === '&' && command[index + 1] === '&') { flush(); index += 1; continue }
+    buffer += char
+  }
+  flush()
+  return segments
+}
+
+/** Index of the `)` closing the `(` at `openIndex`, or -1 when unbalanced. */
+function matchingParen(text, openIndex) {
+  let depth = 0
+  let quote = ''
+  for (let index = openIndex; index < text.length; index += 1) {
+    const char = text[index]
+    if (quote !== '') {
+      if (char === '`') { index += 1; continue }
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === "'" || char === '"') { quote = char; continue }
+    if (char === '(') { depth += 1; continue }
+    if (char === ')') {
+      depth -= 1
+      if (depth === 0) return index
+    }
+  }
+  return -1
+}
+
+/** Text after a container header: `if (cond) <rest>`, `else <rest>`. */
+function afterHeader(text) {
+  const open = text.indexOf('(')
+  if (open === -1) {
+    const space = text.indexOf(' ')
+    return space === -1 ? null : text.slice(space + 1)
+  }
+  const close = matchingParen(text, open)
+  return close === -1 ? null : text.slice(close + 1)
+}
+
+/**
+ * False when quotes, `( … )`, `[ … ]` or `{ … }` do not close. A command the
+ * splitter cannot fully read is judged as a write: ambiguity must not fail open.
+ */
+function isBalanced(command) {
+  let quote = ''
+  let depth = 0
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (quote !== '') {
+      if (char === '`' && quote === '"') { index += 1; continue }
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === '@' && (command[index + 1] === "'" || command[index + 1] === '"')) {
+      const closer = command[index + 1] === "'" ? "'@" : '"@'
+      const end = command.indexOf(`\n${closer}`, index + 2)
+      if (end === -1) return false
+      index = end + 2
+      continue
+    }
+    if (char === "'" || char === '"') { quote = char; continue }
+    if (char === '`') { index += 1; continue }
+    if (char === '(' || char === '[' || char === '{') { depth += 1; continue }
+    if (char === ')' || char === ']' || char === '}') {
+      depth -= 1
+      if (depth < 0) return false
+    }
+  }
+  return quote === '' && depth === 0
+}
+
+/** Scan one expandable string body for `$( … )` substitutions. */
+function scanExpandable(body, bodies) {
+  let index = 0
+  while (index < body.length) {
+    if (body[index] === '`') { index += 2; continue }
+    if (body[index] === '$' && body[index + 1] === '(') {
+      const close = matchingParen(body, index + 1)
+      if (close === -1) return
+      bodies.push(body.slice(index + 2, close))
+      index = close + 1
+      continue
+    }
+    index += 1
+  }
+}
+
+/**
+ * `$( … )` bodies found outside single quotes. A single-quoted string is a
+ * literal, but a double-quoted one still executes its substitutions. The same
+ * split applies to here-strings: `@" … "@` expands, `@' … '@` does not.
+ */
+function collectSubexpressions(command) {
+  const bodies = []
+  let index = 0
+  while (index < command.length) {
+    const char = command[index]
+    if (char === '@' && (command[index + 1] === "'" || command[index + 1] === '"')) {
+      const closer = command[index + 1] === "'" ? "'@" : '"@'
+      const end = command.indexOf(`\n${closer}`, index + 2)
+      if (end === -1) return bodies
+      if (command[index + 1] === '"') scanExpandable(command.slice(index + 2, end), bodies)
+      index = end + 3
+      continue
+    }
+    if (char === "'") {
+      index += 1
+      while (index < command.length) {
+        if (command[index] === "'") {
+          if (command[index + 1] === "'") { index += 2; continue }
+          break
+        }
+        index += 1
+      }
+      index += 1
+      continue
+    }
+    if (char === '"') {
+      index += 1
+      while (index < command.length) {
+        if (command[index] === '`') { index += 2; continue }
+        if (command[index] === '"') { index += 1; break }
+        if (command[index] === '$' && command[index + 1] === '(') {
+          const close = matchingParen(command, index + 1)
+          if (close === -1) return bodies
+          bodies.push(command.slice(index + 2, close))
+          index = close + 1
+          continue
+        }
+        index += 1
+      }
+      continue
+    }
+    if (char === '`') { index += 2; continue }
+    if (char === '$' && command[index + 1] === '(') {
+      const close = matchingParen(command, index + 1)
+      if (close === -1) return bodies
+      bodies.push(command.slice(index + 2, close))
+      index = close + 1
+      continue
+    }
+    index += 1
+  }
+  return bodies
+}
+
+/** `write` when the text or any of its `$( … )` substitutions writes. */
+function writesIn(text, shellMode, depth = 0) {
+  if (depth > 8) return true
+  if (verdictOf(text, shellMode, depth) === 'write') return true
+  for (const body of collectSubexpressions(text)) {
+    if (body.trim() !== '' && writesIn(body, shellMode, depth + 1)) return true
+  }
+  return false
+}
+
 /**
  * `read` when the segment certainly only reads, otherwise `write`.
- * Unknown commands count as writes unless the shell mode is `lenient`.
+ *
+ * Container keywords (`if`, `foreach`, `function`, …) and variable assignments
+ * are peeled first so their bodies and right-hand sides are judged as the
+ * commands they are. Unknown commands still count as writes unless the shell
+ * mode is `lenient`.
  */
-function segmentVerdict(segment, shellMode) {
-  const token = firstToken(segment)
+function commandVerdict(segment, shellMode, depth = 0) {
+  const trimmed = segment.trim()
+  if (trimmed === '') return 'read'
+  if (depth > 8) return 'write'
+
+  // A bare string expression only prints.
+  if (/^["']/.test(trimmed)) return 'read'
+
+  // `$x = <expr>`: judge the right-hand side, not the assignment.
+  const assignment = /^\$[A-Za-z_][A-Za-z0-9_:]*\s*=\s*([\s\S]*)$/.exec(trimmed)
+  if (assignment !== null) {
+    const rhs = assignment[1].trim()
+    return rhs === '' ? 'read' : verdictOf(rhs, shellMode, depth + 1)
+  }
+
+  // `$( … )` runs the commands inside: it is a command context, not a value.
+  if (trimmed.startsWith('$(')) {
+    const close = matchingParen(trimmed, 1)
+    if (close === -1) return 'write'
+    const body = trimmed.slice(2, close)
+    if (body.trim() !== '' && writesIn(body, shellMode, depth + 1)) return 'write'
+    // A member access after the sub-expression (`.Length`, `[0]`) is a value.
+    const tail = trimmed.slice(close + 1).trim()
+    return tail === '' || tail.startsWith('.') || tail.startsWith('[') ? 'read' : 'write'
+  }
+
+  // A here-string statement is a value, never a command name. The expandable
+  // form is still scanned for `$( … )` by writesIn().
+  if (trimmed.startsWith("@'") || trimmed.startsWith('@"')) return 'read'
+
+  // Any other variable-led expression is a value (`.Replace(…)`, `[0]`, …).
+  if (trimmed.startsWith('$')) return 'read'
+
+  // Numeric and operator-led literals are values, not command names.
+  if (/^[0-9]/.test(trimmed)) return 'read'
+  if (/^[-!+,]/.test(trimmed)) return 'read'
+
+  // `( … )` is a sub-expression: judge what it contains.
+  if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
+    return verdictOf(trimmed.slice(1, -1), shellMode, depth + 1)
+  }
+
+  // `@( … )` is an array literal whose elements are expressions of their own.
+  if (trimmed.startsWith('@(')) {
+    const close = trimmed.lastIndexOf(')')
+    const body = close === -1 ? trimmed.slice(2) : trimmed.slice(2, close)
+    return body.trim() === '' ? 'read' : verdictOf(body, shellMode, depth + 1)
+  }
+  // `@{ … }` is a hash literal: keys and values only.
+  if (trimmed.startsWith('@{')) return 'read'
+
+  const token = firstToken(trimmed)
   if (token === '') return 'read'
-  const name = commandName(token)
+  const rawName = commandName(token)
+  const name = BLOCK_ALIASES.get(rawName) ?? rawName
+
+  if (CONTAINER_COMMANDS.has(name) || BLOCK_COMMANDS.has(name)) {
+    const bodies = blockBodies(trimmed)
+    if (bodies.length > 0) {
+      if (bodies.some(body => verdictOf(body, shellMode, depth + 1) === 'write')) return 'write'
+      // Anything after the last block is another statement of the same segment.
+      const last = trimmed.lastIndexOf('}')
+      const tail = last === -1 ? '' : trimmed.slice(last + 1).trim()
+      return tail === '' ? 'read' : verdictOf(tail, shellMode, depth + 1)
+    }
+    // PowerShell allows `if (cond) <statement>` and `foreach (…) <command>`
+    // without braces, so judge what follows the header instead of assuming an
+    // empty body.
+    const rest = afterHeader(trimmed)
+    if (rest === null) return 'write'
+    return rest.trim() === '' ? 'read' : verdictOf(rest, shellMode, depth + 1)
+  }
+
   if (READ_ONLY_COMMANDS.has(name)) return 'read'
-  if (name === 'git') return gitVerdict(segment)
+  if (name === 'git') return gitVerdict(trimmed)
   // `sed -i` / `perl -i` edit files in place; without the flag they only read.
-  if (name === 'sed' || name === 'perl') return /(?:^|\s)-\w*i/.test(segment) ? 'write' : 'read'
+  if (name === 'sed' || name === 'perl') return /(?:^|\s)-\w*i/.test(trimmed) ? 'write' : 'read'
   if (WRITE_COMMANDS.has(name)) return 'write'
   return shellMode === 'lenient' ? 'read' : 'write'
 }
 
-/** Split on newlines and the shell operators `;`, `&&`, `||` and `|`. */
-function commandSegments(command) {
-  return command
-    .split(/\r?\n|;|&&|\|\||\|/)
-    .map(segment => segment.trim())
-    .filter(segment => segment !== '')
+/** `write` when any segment of `text` writes. */
+function verdictOf(text, shellMode, depth = 0) {
+  return commandSegments(text).some(segment => commandVerdict(segment, shellMode, depth) === 'write') ? 'write' : 'read'
 }
 
 /** First pattern that matches, in HIGH_RISK_PATTERNS order, or null. */
@@ -553,7 +912,7 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
 
   const tokens = collectAbsoluteTokens(text)
   const systemToken = tokens.find(token => isSystemPath(token, systemRoots)) ?? null
-  const writes = REDIRECT.test(text) || commandSegments(text).some(segment => segmentVerdict(segment, shellMode) === 'write')
+  const writes = !isBalanced(text) || REDIRECT.test(text) || writesIn(text, shellMode)
 
   if (writes) {
     let systemTarget = systemToken
@@ -573,7 +932,7 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
       if (!CONFIG_TEXT.test(segment)) return false
       // Mentioning a path is not writing it: require a write verb or a redirect
       // in the same segment.
-      return REDIRECT.test(segment) || segmentVerdict(segment, shellMode) === 'write'
+      return REDIRECT.test(segment) || writesIn(segment, shellMode)
     })
     if (configHit) {
       return decision(
@@ -792,6 +1151,29 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
       'normal',
       `Approval required before running project code: ${name}`,
       `运行项目代码需要审批：${name}`,
+    )
+  }
+
+  // Autonomy travels through tools, not shells: these keep working after the
+  // user leaves, so `gateShell` does not apply. `update_goal` is split by
+  // action because finishing a goal removes autonomy instead of granting it.
+  if (name === 'update_goal') {
+    const action = args !== null && typeof args === 'object' ? args.action : undefined
+    if (!AUTONOMY_GOAL_ACTIONS.has(action)) return null
+    return decision(
+      'deferred-action',
+      'high',
+      `Approval required before granting autonomous work (update_goal:${action}): ${autonomySummary(name, args)}`,
+      `自主性操作需要审批（update_goal:${action}）：${autonomySummary(name, args)}`,
+    )
+  }
+
+  if (AUTONOMY_TOOLS.has(name)) {
+    return decision(
+      'deferred-action',
+      'high',
+      `Approval required before granting autonomous work (${name}): ${autonomySummary(name, args)}`,
+      `自主性操作需要审批（${name}）：${autonomySummary(name, args)}`,
     )
   }
 
