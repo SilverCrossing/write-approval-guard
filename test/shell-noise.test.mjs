@@ -96,6 +96,18 @@ test('substitutions are judged even inside double-quoted strings', () => {
   assert.equal(call('"$(Get-Content a.txt)"'), null)
 })
 
+test('a parenthesized expression with a property tail is a value', () => {
+  assert.equal(call("($t -replace '\\s','').Length"), null)
+  assert.equal(call('(Get-Content a.txt).Length'), null)
+  assert.equal(call('(Get-ChildItem .).Count'), null)
+  assert.equal(call('(Get-ChildItem .)[0]'), null)
+})
+
+test('a method call on a parenthesized expression stays a write', () => {
+  assert.equal(call('(Get-Item a.txt).Delete()').kind, 'shell-write')
+  assert.equal(call('(Get-Content a.txt).Clear()').kind, 'shell-write')
+})
+
 test('block aliases resolve to their cmdlets', () => {
   assert.equal(call('Get-ChildItem . | % { $_.Name }'), null)
   assert.equal(call('Get-ChildItem . | % { Set-Content $_.Name x }').kind, 'shell-write')

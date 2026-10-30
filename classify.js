@@ -848,9 +848,16 @@ function commandVerdict(segment, shellMode, depth = 0) {
   if (/^[0-9]/.test(trimmed)) return 'read'
   if (/^[-!+,]/.test(trimmed)) return 'read'
 
-  // `( … )` is a sub-expression: judge what it contains.
-  if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
-    return verdictOf(trimmed.slice(1, -1), shellMode, depth + 1)
+  // `( … )` is a sub-expression: judge what it contains, then decide whether
+  // the tail is a value access. Only property/index chains count, so
+  // `(Get-Item x).Delete()` still fails closed.
+  if (trimmed.startsWith('(')) {
+    const close = matchingParen(trimmed, 0)
+    if (close === -1) return 'write'
+    const body = trimmed.slice(1, close)
+    if (body.trim() !== '' && verdictOf(body, shellMode, depth + 1) === 'write') return 'write'
+    const tail = trimmed.slice(close + 1).trim()
+    return tail === '' || /^(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d*\])+$/.test(tail) ? 'read' : 'write'
   }
 
   // `@( … )` is an array literal whose elements are expressions of their own.
