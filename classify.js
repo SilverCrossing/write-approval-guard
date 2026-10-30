@@ -83,6 +83,18 @@ const READ_TOOLS = Object.freeze({ read: 'file_path', read_image: 'file_path' })
 /** Tools with no write or sensitive-read meaning; never gated. */
 const READ_ONLY_TOOLS = new Set(['syntax_check', 'safe_backups'])
 
+/**
+ * In-workspace locations that stay gated even when `gateWrites: "workspace"`
+ * freely allows ordinary workspace writes: git hooks and dotfiles execute
+ * later, and `node_modules/.bin` launchers are run by name.
+ */
+export const DEFAULT_PROTECTED_PATTERNS = Object.freeze([
+  '**/.git/**',
+  '**/.dsh/**',
+  '**/node_modules/.bin/**',
+  '**/.github/workflows/**',
+])
+
 /** Every tool name this plugin understands; anything else is "unknown". */
 const KNOWN_TOOLS = new Set([
   ...Object.keys(WRITE_TOOL_PATHS),
@@ -971,10 +983,17 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
   return null
 }
 
-function classifyWrite(tool, value, cwd, { systemRoots, sensitivePatterns, exemptPaths, configPatterns }) {
+function classifyWrite(tool, value, cwd, { systemRoots, sensitivePatterns, exemptPaths, configPatterns, protectedPatterns = [] }) {
   const target = value.trim()
   const absolute = absoluteOf(target, cwd)
   const real = absolute === null ? null : realpathDeep(absolute)
+  // Placement decides `gateWrites: "workspace"`: inside the session directory
+  // and outside the protected list. An unresolvable path counts as outside.
+  const inWorkspace = absolute !== null
+    && typeof cwd === 'string'
+    && cwd.trim() !== ''
+    && isInside(cwd, absolute)
+    && matchSensitiveAny([absolute, real, target], protectedPatterns) === null
 
   for (const candidate of [absolute, real]) {
     if (candidate !== null && isSystemPath(candidate, systemRoots)) {
@@ -1007,25 +1026,34 @@ function classifyWrite(tool, value, cwd, { systemRoots, sensitivePatterns, exemp
       `写入敏感文件需要审批：${short(absolute ?? target)}`,
     )
   }
-  return decision(
-    'write',
-    'normal',
-    `Approval required before writing: ${short(absolute ?? target)}`,
-    `写操作需要审批：${short(absolute ?? target)}`,
-  )
+  return {
+    ...decision(
+      'write',
+      'normal',
+      `Approval required before writing: ${short(absolute ?? target)}`,
+      `写操作需要审批：${short(absolute ?? target)}`,
+    ),
+    inWorkspace,
+  }
 }
 
 /** Classify every target of one call; the highest risk wins. */
 function classifyWriteMany(tool, values, cwd, options) {
   let worst = null
+  let outside = false
   for (const value of values) {
     const candidate = classifyWrite(tool, value, cwd, options)
     if (candidate === null) continue
+    // One target outside the workspace keeps the whole call outside: a multi-file
+    // edit must not ride on the placement of its first file.
+    if (candidate.inWorkspace !== true) outside = true
     if (worst === null || (worst.risk !== 'high' && candidate.risk === 'high')) worst = candidate
   }
-  if (worst === null || values.length < 2) return worst
+  if (worst === null) return null
+  const placed = { ...worst, inWorkspace: worst.inWorkspace === true && !outside }
+  if (values.length < 2) return placed
   return {
-    ...worst,
+    ...placed,
     displayReason: {
       en: `${worst.displayReason.en} (${values.length} files in this call)`,
       zh: `${worst.displayReason.zh}（本次共 ${values.length} 个文件）`,
@@ -1112,6 +1140,9 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
     ...DEFAULT_CONFIG_PATTERNS,
     ...(Array.isArray(config.extraConfigPaths) ? config.extraConfigPaths : []),
   ]
+  const protectedPatterns = Array.isArray(config.protectedPaths)
+    ? config.protectedPaths
+    : DEFAULT_PROTECTED_PATTERNS
   const gateShell = config.gateShell !== false
   const shellMode = config.shellMode === 'lenient' || config.shellMode === 'off' ? config.shellMode : 'conservative'
   const sensitiveRisk = config.sensitiveReadConfirmations === 'double' ? 'high' : 'normal'
@@ -1137,7 +1168,7 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
     if (args === null || typeof args !== 'object') return null
     const values = pathReader(args).filter(value => typeof value === 'string' && value.trim() !== '')
     if (values.length === 0) return null
-    const decision = classifyWriteMany(name, values, cwd, { systemRoots, sensitivePatterns, exemptPaths, configPatterns })
+    const decision = classifyWriteMany(name, values, cwd, { systemRoots, sensitivePatterns, exemptPaths, configPatterns, protectedPatterns })
     if (decision !== null && name === 'safe_rollback') {
       return withRollbackNote(decision, args, values[0], cwd)
     }

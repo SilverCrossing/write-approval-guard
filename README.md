@@ -53,6 +53,40 @@
 
 代价很明确：普通写不再有人把关，出问题只能靠快照回滚（配合 `dsh-safety-toolkit` 时每个文件都有备份）。这是拿“每次确认”换“确认的有效性”。
 
+## 工作区模式：`gateWrites: workspace`
+
+介于 `all` 和 `risky` 之间的第三档：**工作区内的普通写放行，其它一切照旧审批**。
+
+| 判定 | `workspace` |
+| --- | --- |
+| 工作区内的 `write` / `safe_write` / `edit` / `safe_edit` / `multi_edit` | **放行** |
+| 同上，但目标在工作区外 | 审批 |
+| 同上，但命中 `protectedPaths` | 审批 |
+| 命令行写（`shell-write`，包含未知命令） | **审批** |
+| 系统路径 / 配置行为文件 / 递归删除 / 敏感读写 | 审批（高危仍两次） |
+
+两个刻意的取舍：
+
+1. **不覆盖 `shell-write`**。命令能写到任何地方，而且沙箱不总是可靠，所以命令执行仍然逐次审批。
+2. **不放行保护路径**。`protectedPaths` 默认只拦“会在以后自动执行的东西”：`.git/**`、`.dsh/**`、`node_modules/.bin/**`、`.github/workflows/**`。要保护自己的插件仓库，把它加进这个列表。
+
+判定**不依赖文件沙箱**：目标会先 `resolve` 再 `realpath`，然后判断是否在会话目录内；解析不出来按“工作区外”处理。多文件调用（`multi_edit`）只要有一个目标在外面或受保护，整个调用就要审批。
+
+典型用途是**给子代理一点工作能力**：子代理没有审批通道，`all` 模式下连改一行都会被拒绝；`workspace` 模式下它可以编辑工作区文件，但仍然执行不了命令、碰不了配置与系统路径。
+
+### 只放开子代理
+
+主会话逐次审批、子代理能改文件，这是两个独立的旋钮：
+
+```yaml
+gateWrites: all
+subagentGateWrites: workspace
+```
+
+判定用 `agents.roots()`（顶层 agent 列表）：不在列表里的视为子代理。服务不可用或查询抛错时按**主会话**处理，也就是采用更严的那一档。日志里的 `allow` 行会带 `scope: "main" | "subagent"`，事后能分辨是谁被放行的。
+
+注意 `subagentGateWrites: risky` 是**危险组合**：它会连 shell 命令一起放行，而子代理没有审批通道来兑底。
+
 ## 高危清单
 
 默认开启以下六类（`highRiskConfirmations: single` 可整体退化成单次）：
@@ -180,7 +214,9 @@
     confirmGapMs: 2000             # 二次确认之间的强制停顿（毫秒，0 = 关闭）
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
-    gateWrites: all                # all | risky
+    gateWrites: all                # all | risky | workspace
+    subagentGateWrites: ''         # all | risky | workspace；留空 = 继承 gateWrites
+    protectedPaths: []             # 省略=默认规则；[]=关闭；命中仍审批
     extraConfigPaths: []           # 追加“配置/行为文件”路径
     highRiskConfirmations: double  # double | single
     sensitiveReadConfirmations: single  # single | double

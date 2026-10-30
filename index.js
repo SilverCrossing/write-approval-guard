@@ -27,6 +27,7 @@
  */
 import {
   classifyToolCall,
+  DEFAULT_PROTECTED_PATTERNS,
   DEFAULT_SENSITIVE_PATTERNS,
 } from './classify.js'
 import { createLogger } from './log.js'
@@ -37,6 +38,12 @@ export const name = 'write-approval-guard'
 export const inject = ['tools']
 
 const MODES = new Set(['enforce', 'off'])
+const GATE_MODES = new Set(['all', 'risky', 'workspace'])
+
+/** Normalize a write-gate policy, falling back to `fallback` when unset. */
+function normalizeGate(value, fallback) {
+  return GATE_MODES.has(value) ? value : fallback
+}
 const DEFAULT_MODE = 'enforce'
 const ON_REJECT = new Set(['call', 'turn'])
 
@@ -93,9 +100,15 @@ function normalizeConfig(raw) {
   if (config.unknownTools !== undefined && !['allow', 'ask'].includes(config.unknownTools)) {
     warn('config.unknownTools must be "allow" or "ask"; keeping "allow"')
   }
-  const gateWrites = config.gateWrites === 'risky' ? 'risky' : 'all'
-  if (config.gateWrites !== undefined && !['all', 'risky'].includes(config.gateWrites)) {
-    warn('config.gateWrites must be "all" or "risky"; keeping "all"')
+  const gateWrites = normalizeGate(config.gateWrites, 'all')
+  if (config.gateWrites !== undefined && !GATE_MODES.has(config.gateWrites)) {
+    warn('config.gateWrites must be "all", "risky" or "workspace"; keeping "all"')
+  }
+  // Subagents have no approval channel, so their policy can differ from the
+  // main session's. Unset inherits `gateWrites`.
+  const subagentGateWrites = normalizeGate(config.subagentGateWrites, gateWrites)
+  if (config.subagentGateWrites !== undefined && !GATE_MODES.has(config.subagentGateWrites)) {
+    warn('config.subagentGateWrites must be "all", "risky" or "workspace"; keeping gateWrites')
   }
   return {
     mode,
@@ -106,7 +119,9 @@ function normalizeConfig(raw) {
     onReject,
     unknownTools,
     gateWrites,
+    subagentGateWrites,
     extraConfigPaths: stringList(config.extraConfigPaths, 'extraConfigPaths', []),
+    protectedPaths: stringList(config.protectedPaths, 'protectedPaths', DEFAULT_PROTECTED_PATTERNS),
     highRiskConfirmations,
     sensitiveReadConfirmations,
     gateShell: config.gateShell !== false,
@@ -127,6 +142,25 @@ async function sessionCwd(ctx, exec) {
     return await workingDirectory.ensure(exec.agent, exec.signal)
   } catch {
     return null
+  }
+}
+
+/**
+ * Whether one call comes from a subagent instead of a top-level session.
+ *
+ * `agents.roots()` lists the agents created without an owning agent context;
+ * `subagent` and `workflow` children have one, so they are absent from it. A
+ * missing service or a thrown lookup counts as top-level, which means the
+ * stricter main-session policy applies.
+ */
+function isSubagentCall(ctx, exec) {
+  if (exec.agent === undefined || exec.agent === null) return false
+  const agents = ctx.get('agents')
+  if (agents === undefined || typeof agents.roots !== 'function') return false
+  try {
+    return !agents.roots().some(agent => agent.id === exec.agent.id)
+  } catch {
+    return false
   }
 }
 
@@ -265,11 +299,16 @@ function usage() {
   ].join('\n')
 }
 
+/** Human label for one write-gate policy. */
+function gateLabel(value) {
+  return value === 'all' ? '全部写入' : value === 'risky' ? '仅高风险' : '工作区内放行'
+}
+
 function statusText(mode, config) {
   const high = config.highRiskConfirmations === 'double' ? '两次确认' : '仅一次确认'
   return [
     `写操作审批：${mode === 'enforce' ? '启用' : '已关闭'}（配置默认：${config.mode}）`,
-    `写入门禁：${config.gateWrites === 'risky' ? '仅高风险' : '全部写入'}`,
+    `写入门禁：${gateLabel(config.gateWrites)}（子代理：${gateLabel(config.subagentGateWrites)}）`,
     `拒绝行为：${config.onReject === 'turn' ? '拒绝并停止本轮' : '仅拒绝本次调用'}`,
     `未登记工具：${config.unknownTools === 'ask' ? '审批' : '放行'}`,
     `高危操作：${high}`,
@@ -393,10 +432,22 @@ export function apply(ctx, rawConfig) {
 
     if (decision === null) return next()
 
+    const scope = isSubagentCall(ctx, exec) ? 'subagent' : 'main'
+    const gateWrites = scope === 'subagent' ? config.subagentGateWrites : config.gateWrites
+
     // `gateWrites: "risky"` trades per-write approval for attention: ordinary
     // writes pass, only system/destructive/sensitive decisions stop here.
-    if (config.gateWrites === 'risky' && (decision.kind === 'write' || decision.kind === 'shell-write')) {
-      logger.write({ event: 'allow', tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'risky', agent: exec.agent?.id, callId: exec.callId })
+    if (gateWrites === 'risky' && (decision.kind === 'write' || decision.kind === 'shell-write')) {
+      logger.write({ event: 'allow', rule: 'risky', scope, tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'risky', agent: exec.agent?.id, callId: exec.callId })
+      return next()
+    }
+
+    // `gateWrites: "workspace"` frees ordinary file edits inside the session
+    // directory and keeps everything else gated. It deliberately does not cover
+    // `shell-write`: a command can write anywhere, and the file sandbox is not
+    // assumed to be intact.
+    if (gateWrites === 'workspace' && decision.kind === 'write' && decision.inWorkspace === true) {
+      logger.write({ event: 'allow', rule: 'workspace-write', scope, tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'workspace', agent: exec.agent?.id, callId: exec.callId })
       return next()
     }
 
