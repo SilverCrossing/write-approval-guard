@@ -87,6 +87,16 @@ subagentGateWrites: workspace
 
 注意 `subagentGateWrites: risky` 是**危险组合**：它会连 shell 命令一起放行，而子代理没有审批通道来兑底。
 
+## 委派审批：`gateDelegation`
+
+`subagent`、`subagent_fork`、`workflow`、`spawn_teammate` 不写文件，但一次调用可以开出一整棵树——子代理还能再派子代理，几十个一起烧 token。
+
+默认开启（`gateDelegation: true`）：每次委派一次审批，文案里带目标描述；`workflow` 会额外报告脚本里 `agent()` 的调用次数（脚本会扇出多少个）。
+
+一个副作用是**递归被截断**：子代理没有审批通道，它自己再想派子代理时会被 fail-closed。所以除非你在主会话逐层批准，委派深度天然不超过一层。
+
+这条与 `gateWrites` 无关：`risky` 和 `workspace` 档都不会放行委派。
+
 ## 高危清单
 
 默认开启以下六类（`highRiskConfirmations: single` 可整体退化成单次）：
@@ -221,6 +231,7 @@ subagentGateWrites: workspace
     highRiskConfirmations: double  # double | single
     sensitiveReadConfirmations: single  # single | double
     gateShell: true
+    gateDelegation: true           # 委派子代理是否也要审批
     shellMode: conservative        # conservative | lenient | off
     sensitivePaths: []             # 省略=默认规则；[]=关闭敏感识别
     extraSystemRoots: []           # 追加系统路径

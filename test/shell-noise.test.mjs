@@ -108,6 +108,18 @@ test('a method call on a parenthesized expression stays a write', () => {
   assert.equal(call('(Get-Content a.txt).Clear()').kind, 'shell-write')
 })
 
+test('pure .NET static calls are values, IO and Environment are not', () => {
+  assert.equal(call("([regex]::Matches($t, '[a-z]')).Count"), null)
+  assert.equal(call('[math]::Round(1.5)'), null)
+  assert.equal(call("[IO.File]::WriteAllText('a.txt','x')").kind, 'shell-write')
+  assert.equal(call('[Environment]::Exit(0)').kind, 'shell-write')
+})
+
+test('the translation char-count command is read-only', () => {
+  const command = "$t = Get-Content -Raw 'x.md'; $cjk = ([regex]::Matches($t, '[\\u4e00-\\u9fff]')).Count; $all = ($t -replace '\\s','').Length; \"CJK=$cjk ALLNOSPACE=$all\""
+  assert.equal(call(command), null)
+})
+
 test('block aliases resolve to their cmdlets', () => {
   assert.equal(call('Get-ChildItem . | % { $_.Name }'), null)
   assert.equal(call('Get-ChildItem . | % { Set-Content $_.Name x }').kind, 'shell-write')

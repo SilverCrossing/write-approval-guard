@@ -125,6 +125,7 @@ function normalizeConfig(raw) {
     highRiskConfirmations,
     sensitiveReadConfirmations,
     gateShell: config.gateShell !== false,
+    gateDelegation: config.gateDelegation !== false,
     shellMode,
     sensitivePaths: stringList(config.sensitivePaths, 'sensitivePaths', DEFAULT_SENSITIVE_PATTERNS),
     extraSystemRoots: stringList(config.extraSystemRoots, 'extraSystemRoots', []),

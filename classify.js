@@ -43,6 +43,16 @@ const WRITE_TOOL_PATHS = Object.freeze({
     : []),
 })
 
+/**
+ * .NET static types that only compute values. Every other `[Type]::` call is
+ * judged as a write: `[IO.File]::WriteAllText` and `[Environment]::Exit` are why
+ * this is an allowlist instead of a denylist.
+ */
+const READ_ONLY_STATICS = new Set([
+  'regex', 'math', 'string', 'char', 'convert', 'datetime', 'timespan',
+  'guid', 'uri', 'version', 'cultureinfo', 'encoding', 'bitconverter',
+])
+
 /** Tools that run project code but declare no file path. */
 const EXECUTION_WRITE_TOOLS = new Set(['test_runner'])
 
@@ -82,6 +92,33 @@ const READ_TOOLS = Object.freeze({ read: 'file_path', read_image: 'file_path' })
 
 /** Tools with no write or sensitive-read meaning; never gated. */
 const READ_ONLY_TOOLS = new Set(['syntax_check', 'safe_backups'])
+
+/**
+ * Tools that create more agents. They write nothing, but one call can start a
+ * whole tree that spends tokens on its own, and a child has no approval channel
+ * to ask again — so delegation is where the fan-out has to stop.
+ */
+const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow', 'spawn_teammate'])
+
+/** One-line summary of what a delegation call is about to start. */
+function delegationSummary(name, args) {
+  if (args === null || typeof args !== 'object') return ''
+  if (name === 'workflow') {
+    const meta = args.meta !== null && typeof args.meta === 'object' ? args.meta : {}
+    const label = typeof meta.name === 'string' ? meta.name : ''
+    const script = typeof args.script === 'string' ? args.script : ''
+    const spawns = (script.match(/\bagent\s*\(/g) ?? []).length
+    const parts = []
+    if (label !== '') parts.push(label)
+    if (spawns > 0) parts.push(`${spawns} agent() call(s)`)
+    else if (script !== '') parts.push('script without agent() calls')
+    return parts.join(' · ')
+  }
+  const text = typeof args.description === 'string' ? args.description
+    : typeof args.prompt === 'string' ? args.prompt
+      : typeof args.task === 'string' ? args.task : ''
+  return short(text, 120)
+}
 
 /**
  * In-workspace locations that stay gated even when `gateWrites: "workspace"`
@@ -328,6 +365,9 @@ const READ_ONLY_COMMANDS = new Set([
   'write-progress', 'write-verbose', 'write-information', 'get-history',
   'test-connection', 'resolve-dnsname', 'get-ciminstance', 'get-wmiobject',
   'get-eventlog', 'get-winevent',
+  // More read-only cmdlets: hashing, XML/StringData parsing, and diagnostics.
+  'get-filehash', 'select-xml', 'convertfrom-stringdata', 'get-random',
+  'get-culture', 'get-host', 'test-netconnection', 'out-gridview',
 ])
 
 /** Commands that write, so a plain invocation needs one approval. */
@@ -869,6 +909,13 @@ function commandVerdict(segment, shellMode, depth = 0) {
   // `@{ … }` is a hash literal: keys and values only.
   if (trimmed.startsWith('@{')) return 'read'
 
+  // `[Type]::Method(…)`: only pure helper types are values.
+  const staticCall = /^\[([A-Za-z_][A-Za-z0-9_.]*)\]\s*::/.exec(trimmed)
+  if (staticCall !== null) {
+    const type = staticCall[1].toLowerCase().split('.').pop()
+    return READ_ONLY_STATICS.has(type) ? 'read' : 'write'
+  }
+
   const token = firstToken(trimmed)
   if (token === '') return 'read'
   const rawName = commandName(token)
@@ -1226,6 +1273,16 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
   if (name === 'grep' || name === 'glob') {
     if (args === null || typeof args !== 'object') return null
     return escalate(classifySearch(name, args, cwd, { sensitivePatterns }), sensitiveRisk)
+  }
+
+  if (config.gateDelegation !== false && DELEGATION_TOOLS.has(name)) {
+    const detail = delegationSummary(name, args)
+    return decision(
+      'delegation',
+      'normal',
+      `Approval required before starting more agents (${name})${detail === '' ? '' : `: ${detail}`}`,
+      `委派子代理需要审批（${name}）${detail === '' ? '' : `：${detail}`}`,
+    )
   }
 
   if (config.unknownTools === 'ask' && !KNOWN_TOOLS.has(name)) {
