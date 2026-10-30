@@ -99,16 +99,30 @@ subagentGateWrites: workspace
 
 ## 高危清单
 
-默认开启以下六类（`highRiskConfirmations: single` 可整体退化成单次）：
+默认开启以下十类（`highRiskConfirmations: single` 可整体退化成单次）：
 
-| 类别 | 例子 |
-| --- | --- |
-| 磁盘/格式化 | `format C:`、`diskpart`、`Clear-Disk`、`Initialize-Disk`、`mkfs`、`dd if=`、`cipher /w` |
-| 递归/通配删除 | `Remove-Item -Recurse`、`Remove-Item *`、`rm -rf`、`rd /s`、`del /f /s`、`del *.*` |
-| 系统配置/系统目录 | `reg add|delete`、`Set-ItemProperty HKLM:`、`sc config|delete`、`Set-Service`、`bcdedit`、`netsh`、`shutdown`、`schtasks /create`、`setx`、`Set-ExecutionPolicy`、写 `C:\Windows`、`C:\Program Files`、`/etc`、`/usr` |
-| 权限/所有权 | `icacls /reset|grant`、`cacls`、`takeown /f`、`chmod -R`、`chown -R`、`chmod 777` |
-| 下载即执行 | `iwr … \| iex`、`curl … \| bash`、`iex (…DownloadString…)`——你只能看到 URL，看不到载荷 |
-| 自主性工具 | `schedule_create`、`schedule_update`、`create_goal`、`update_goal`（`edit` / `resume`）——会在你离开后继续工作 |
+| 类别 | 例子 | 卡片上显示的风险点 |
+| --- | --- | --- |
+| 磁盘/格式化 | `format C:`、`diskpart`、`Clear-Disk`、`Initialize-Disk`、`Format-Volume`、`mkfs`、`dd if=`、`cipher /w` | 数据无法从文件系统恢复 |
+| 递归/通配删除 | `Remove-Item -Recurse`、`Remove-Item *`、`rm -rf`、`rd /s`、`del /f /s`、`del *.*` | 不经过回收站，没有可还原的来源 |
+| 备份/还原点 | `vssadmin delete shadows`、`wbadmin delete`、`Disable-ComputerRestore`、`Remove-ComputerRestorePoint` | 删掉的正是出事时用来回滚的东西 |
+| 本地账户 | `New-LocalUser`、`Set-LocalUser`、`Add-LocalGroupMember`、`net user … /add`、`net localgroup … /add` | 没有撤销动作，只能凭记忆改回去 |
+| 持久化 | `Register-ScheduledTask`、`schtasks /change`、`Remove-Service`、`New-ItemProperty …\CurrentVersion\Run` | 重启后依然生效 |
+| 安全防线 | `Set-MpPreference`、`New-NetFirewallRule`、`Set-NetFirewallProfile -Enabled false`、`manage-bde -off`、`Enable-BitLocker` | 关掉后不会自己恢复 |
+| 系统配置/系统目录 | `reg add\|delete`、`Set-ItemProperty HKLM:`、`sc config\|delete`、`Set-Service`、`bcdedit`、`netsh`、`shutdown`、`schtasks /create`、`setx`、`Set-ExecutionPolicy`、写 `C:\Windows`、`C:\Program Files`、`/etc`、`/usr` | 旧值通常没有留底 |
+| 权限/所有权 | `icacls /reset\|grant`、`cacls`、`takeown /f`、`chmod -R`、`chown -R`、`chmod 777` | 原 ACL 不会留底 |
+| 下载即执行 | `iwr … \| iex`、`curl … \| bash`、`iex (…DownloadString…)` | 只能看到 URL，看不到载荷 |
+| 自主性工具 | `schedule_create`、`schedule_update`、`create_goal`、`update_goal`（`edit` / `resume`） | 会在你离开后继续工作 |
+
+重危卡片不只是说“命中某类”，而是直接把**不可逆的那一点**写出来，例如：
+
+```text
+高危：命中「删除备份或还原点 (delete backups or restore points)」。
+风险：会删掉系统还原点或备份——出事时正是靠它们回滚，删了就没了。
+将执行：vssadmin delete shadows /all /quiet
+```
+
+只读同一子系统的命令（`vssadmin list shadows`、`Get-LocalUser`、`Get-ScheduledTask`、`manage-bde -status`）**不会**命中高危。
 
 破坏性 Git（`reset --hard`、`clean -xdf`）和包管理器写入**不算**高危，只走单次审批；这是按使用者的选择定的，避免日常疲劳。
 
@@ -225,7 +239,8 @@ subagentGateWrites: workspace
     onReject: call                 # call | turn
     unknownTools: allow            # allow | ask
     gateWrites: all                # all | risky | workspace
-    subagentGateWrites: ''         # all | risky | workspace；留空 = 继承 gateWrites
+    subagentGateWrites: ''         # all | risky | workspace；留空 = 继承解析结果
+    workspaces: []                 # [{ root: 'D:\docs', mode: 'workspace' }]；root 必须绝对路径
     protectedPaths: []             # 省略=默认规则；[]=关闭；命中仍审批
     extraConfigPaths: []           # 追加“配置/行为文件”路径
     highRiskConfirmations: double  # double | single
@@ -252,13 +267,49 @@ subagentGateWrites: workspace
 
 非法值不会静默生效：加载时会打印带期望值的 `console.warn`，再回落到默认值。
 
+## 作用域：配置 → 工作区 → 会话
+
+同一台机器上往往同时开着几个会话：一个在改代码、要逐次审批，另一个只是整理文档、希望工作区内直接放行。判定按三层解析，优先级从高到低：
+
+| 层 | 来源 | 生效范围 | 重启后 |
+|---|---|---|---|
+| 会话覆盖 | `/write-guard all\|workspace\|risky\|off` | 只有当前会话 | 失效，回到下层 |
+| 工作区绑定 | `workspaces: [{ root, mode }]` | 命中最长前缀的所有会话 | 保留 |
+| 配置默认 | `gateWrites` / `mode` | 其余一切 | 保留 |
+
+匹配用**会话目录**（`workingDirectory.ensure`），按整段路径比较：`D:\docs` 不会命中 `D:\docs-old`，Windows 下不区分大小写。`root` 必须是绝对路径——相对值会被拒绝并告警，因为它会解析到插件进程的目录，而不是会话目录。
+
+```yaml
+- id: write-approval-guard
+  config:
+    gateWrites: all
+    workspaces:
+      - root: 'D:\docs'          # 文档仓库：工作区内放行
+        mode: workspace
+      - root: 'D:\work\legacy'
+        mode: risky
+```
+
+两个刻意的“不继承”：
+
+1. **子代理不继承会话覆盖**。子代理没有审批通道，让它跟着“这个会话宽松一点”一起放宽，等于在无人的地方开洞。它按 `subagentGateWrites`（若已配置）→ 工作区绑定 → 配置默认解析。
+2. **会话级 `off` 也只关自己**。要整体关闭请改配置里的 `mode`。
+
+不带 `agent`（无会话上下文）的调用落到同一个进程级桶，行为与改动前一致。
+
 ## 斜杠命令
 
 ```text
-/write-guard status   # 当前模式与规则数量
-/write-guard on       # 启用
-/write-guard off      # 临时关闭（只存在内存里，重启回到配置值）
+/write-guard status     # 本会话生效值 + 来源 + 配置默认 + 工作区绑定
+/write-guard all        # 本会话：每次写入都审批
+/write-guard workspace  # 本会话：工作区内普通写入放行
+/write-guard risky      # 本会话：只拦高危与敏感操作
+/write-guard on         # 本会话：重新启用审批
+/write-guard off        # 本会话：临时关闭
+/write-guard reset      # 清除本会话覆盖，回到配置/工作区绑定
 ```
+
+覆盖只存在于内存，重启回到配置或工作区绑定；`agent/disposed` 时对应条目会被删掉，不会漏给下一个复用该 id 的会话。
 
 命令只能由人发出，模型无法调用，因此不能用它给自己扩权。
 
@@ -292,6 +343,7 @@ subagentGateWrites: workspace
 
 - `event`：`ask` / `deny` / `cancel` / `allow` / `mode` / `approval`（审批结果：allowed-once / rejected / cancelled / unavailable）；
 - 只记录**被判定过**的调用（普通读取不会产生日志）；
+- 每条判定都带 `gateWrites`、`modeSource`（`config` / `workspace` / `session`）和 `session`，事后能分清“是配置、工作区绑定还是会话覆盖给的”；
 - 写日志失败只告警，不影响拦截；
 - `log: false` 关闭，`logDir` 换目录，`logRetentionDays` 改保留天数。
 
@@ -306,6 +358,7 @@ subagentGateWrites: workspace
 7. **与 `outside-access-guard` 共存时只有一个弹窗生效**，工作区外的判定归它，详见上一节。
 8. **只覆盖按名字登记的工具。** 其他插件替换或新增的写工具（包括 MCP 的 `write_file`）不会被拦截，见「工具覆盖与兼容性」。
 9. **插件源码若留在会话工作区**，模型可以改它。公开分发时用 `git+https://…#<commit>` 或 npm 版本安装，安装副本落在 profile 的 `node_modules`（会话工作区之外），这条才闭合。
+10. **只读判定基于命令名与少量参数**：`node --check`、`[IO.File]::ReadAllText`、`ForEach-Object Name` 这类已按只读处理；但 `[IO.File]::Open(...)`、`New-Object byte[]`、`& $var` 这些无法仅从名字判断的构造仍按写处理（宁可多问）。
 
 ## 验证
 

@@ -1,6 +1,6 @@
 {
   "name": "write-approval-guard",
-  "version": "0.5.1",
+  "version": "0.6.2",
   "private": true,
   "license": "MIT",
   "author": "SilverCrossing",
@@ -19,6 +19,7 @@
     "index.js",
     "classify.js",
     "log.js",
+    "scope.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",

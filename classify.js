@@ -51,6 +51,21 @@ const WRITE_TOOL_PATHS = Object.freeze({
 const READ_ONLY_STATICS = new Set([
   'regex', 'math', 'string', 'char', 'convert', 'datetime', 'timespan',
   'guid', 'uri', 'version', 'cultureinfo', 'encoding', 'bitconverter',
+  // Pure-value enums: `[StringComparison]::OrdinalIgnoreCase` is an argument,
+  // not an action, and it appeared inside otherwise read-only pipelines.
+  'stringcomparison', 'stringsplitoptions', 'regexoptions',
+])
+
+/**
+ * Read-only methods on types that also have write methods. `[IO.File]` cannot
+ * join READ_ONLY_STATICS wholesale: that would whitelist `WriteAllText` too.
+ */
+const READ_ONLY_STATICS_METHODS = new Set([
+  'file.openread', 'file.opentext', 'file.exists', 'file.getattributes',
+  'file.readalltext', 'file.readalllines', 'file.readallbytes',
+  'file.getlastwritetime', 'file.getcreationtime', 'file.getlastaccesstime',
+  'directory.getfiles', 'directory.getdirectories', 'directory.exists',
+  'path.combine', 'path.getfullpath', 'path.getfilename',
 ])
 
 /** Tools that run project code but declare no file path. */
@@ -297,9 +312,59 @@ export function defaultSystemRoots() {
 const HIGH_RISK_LABELS = Object.freeze({
   disk: '磁盘/格式化操作 (disk or format)',
   delete: '递归或通配删除 (recursive or wildcard delete)',
+  restore: '删除备份或还原点 (delete backups or restore points)',
+  account: '本地账户或管理员组变更 (local account or group change)',
+  persist: '注册持久化项 (scheduled task, service or autostart)',
+  defense: '关闭或放宽安全防线 (disable or widen a security control)',
   system: '系统配置修改 (system configuration)',
   perm: '权限/所有权修改 (permissions or ownership)',
   download: '下载并直接执行 (download and execute)',
+})
+
+/**
+ * Why a high-risk label matters, shown verbatim in the approval card.
+ *
+ * A second confirmation is only worth a click if the card says what cannot be
+ * undone: "system configuration" tells nobody anything, "this deletes the
+ * restore points you would roll back to" does.
+ */
+const HIGH_RISK_EXPLAIN = Object.freeze({
+  disk: {
+    en: 'It rewrites or wipes a disk or volume; the data on it cannot be recovered from the file system afterwards.',
+    zh: '会改写或清空磁盘/卷，之后无法从文件系统里恢复。',
+  },
+  delete: {
+    en: 'A recursive or wildcard delete skips the recycle bin, so there is nothing left to restore from.',
+    zh: '递归或通配删除不经过回收站，删掉就没有可还原的来源。',
+  },
+  restore: {
+    en: 'It deletes the backups or restore points that would be used to undo a bad change.',
+    zh: '会删掉系统还原点或备份——出事时正是靠它们回滚，删了就没了。',
+  },
+  account: {
+    en: 'It creates or changes a local account or an administrator group. There is no undo; the old values have to be re-entered by hand.',
+    zh: '会新增或修改本地账户/管理员组成员，没有撤销动作，只能凭记忆改回去。',
+  },
+  persist: {
+    en: 'It registers something that runs again after a reboot: a scheduled task, a service, or an autostart entry.',
+    zh: '会注册计划任务、服务或开机自启项——重启之后依然生效。',
+  },
+  defense: {
+    en: 'It turns off or widens a security control such as Defender, the firewall, or volume encryption, and nothing restores it automatically.',
+    zh: '会关闭或放宽 Defender、防火墙、卷加密这类防线，不会自己恢复。',
+  },
+  system: {
+    en: 'It changes machine-wide configuration; the old value is rarely recorded anywhere.',
+    zh: '会修改整机配置，旧值通常没有留底。',
+  },
+  perm: {
+    en: 'It rewrites permissions or ownership; the previous ACL is not kept anywhere.',
+    zh: '会改写权限/所有者，原 ACL 不会留底。',
+  },
+  download: {
+    en: 'It downloads code and runs it in one step, so you only see the URL, never the payload.',
+    zh: '下载与执行在同一步完成，你只能看到 URL，看不到真正跑的代码。',
+  },
 })
 
 /**
@@ -312,6 +377,7 @@ const HIGH_RISK_PATTERNS = Object.freeze([
   ['disk', /\b(?:clear|initialize|format|set|remove|resize|new)-disk\b/i],
   ['disk', /\b(?:clear|initialize|format|set|remove|resize|new)-partition\b/i],
   ['disk', /\bmkfs(?:\.[a-z0-9]+)?\b/i],
+  ['disk', /\bformat-volume\b/i],
   ['disk', /\bdd\s+if=/i],
   ['disk', /\bcipher(?:\.exe)?\b[^\n]*\/w\b/i],
   ['delete', /\b(?:remove-item|ri)\b[^\n]*\s-(?:recurse|r)\b/i],
@@ -320,6 +386,24 @@ const HIGH_RISK_PATTERNS = Object.freeze([
   ['delete', /\b(?:rd|rmdir)\b[^\n]*\/s\b/i],
   ['delete', /\b(?:del|erase)\b[^\n]*\/(?:[a-z]*[fs])/i],
   ['delete', /\b(?:del|erase)\b[^\n]*\*\.\*/i],
+  // Destroying the ability to undo a change: backups, restore points, catalog.
+  ['restore', /\bvssadmin(?:\.exe)?\b[^\n]*\bdelete\b[^\n]*\bshadows\b/i],
+  ['restore', /\bwbadmin(?:\.exe)?\b[^\n]*\bdelete\b/i],
+  ['restore', /\b(?:remove-computerrestorepoint|disable-computerrestore)\b/i],
+  // Local accounts and administrator groups: no undo, only a manual reverse edit.
+  ['account', /\b(?:new|set|remove|enable|disable|rename)-localuser\b/i],
+  ['account', /\b(?:add|remove)-localgroupmember\b/i],
+  ['account', /\bnet(?:\.exe)?\s+(?:user|localgroup)\b[^\n]*\/add\b/i],
+  // Persistence that survives a reboot.
+  ['persist', /\b(?:register|new|set)-scheduledtask(?:action|trigger|principal|settings)?\b/i],
+  ['persist', /\bschtasks\b[^\n]*\/(?:change|delete)\b/i],
+  ['persist', /\b(?:new|set)-itemproperty\b[^\n]*\bcurrentversion\\run\b/i],
+  ['persist', /\bremove-service\b/i],
+  // Turning a security control off, or wider than it was.
+  ['defense', /\b(?:set|add)-mppreference\b/i],
+  ['defense', /\bnew-netfirewallrule\b|\bset-netfirewallprofile\b[^\n]*-enabled\s+\$?false\b/i],
+  ['defense', /\bmanage-bde\b[^\n]*-(?:off|on|pause|resume|protect|unprotect|change|disable|set)\b/i],
+  ['defense', /\b(?:enable|disable|suspend)-bitlocker\b/i],
   ['system', /\b(?:reg|regedit)(?:\.exe)?\s+(?:add|delete|import|copy|restore)\b/i],
   ['system', /\b(?:set|new)-itemproperty\b[^\n]*\b(?:hklm|hkey_local_machine|hku|hkey_users)\b/i],
   ['system', /\b(?:sc|sc\.exe)\s+(?:delete|config|create|failure|sdset|start|stop)\b/i],
@@ -348,7 +432,7 @@ const READ_ONLY_COMMANDS = new Set([
   'push-location', 'pop-location', 'cat', 'type', 'get-content', 'gc', 'more', 'less',
   'head', 'tail', 'grep', 'rg', 'findstr', 'select-string', 'sls', 'get-item', 'gi',
   'test-path', 'resolve-path', 'split-path', 'join-path', 'measure', 'measure-object',
-  'select-object', 'select', 'where-object', 'sort', 'sort-object', 'group-object',
+  'select-object', 'select', 'where-object', 'foreach-object', 'sort', 'sort-object', 'group-object',
   'format-table', 'ft', 'format-list', 'fl', 'convertto-json', 'convertto-csv',
   'get-command', 'gcm', 'get-help', 'help', 'man', 'get-process', 'ps', 'tasklist',
   'get-service', 'whoami', 'hostname', 'id', 'uname', 'ipconfig', 'netstat',
@@ -368,6 +452,18 @@ const READ_ONLY_COMMANDS = new Set([
   // More read-only cmdlets: hashing, XML/StringData parsing, and diagnostics.
   'get-filehash', 'select-xml', 'convertfrom-stringdata', 'get-random',
   'get-culture', 'get-host', 'test-netconnection', 'out-gridview',
+  // Discovery and status cmdlets: they read state and never write it.
+  'get-alias', 'gal', 'get-module', 'gmo', 'get-variable', 'gv', 'get-verb',
+  'get-uiculture', 'get-timezone', 'get-hotfix', 'get-computerinfo',
+  'get-cimclass', 'get-psprovider', 'get-executionpolicy', 'get-uptime',
+  'get-mpcomputerstatus', 'get-netadapter', 'get-netipaddress', 'get-netroute',
+  'get-dnsclientcache', 'get-nettcpconnection',
+  // Read-only output and input helpers.
+  'read-host', 'convertto-html', 'out-default', 'out-host', 'oh', 'cls',
+  'history', 'test-json',
+  // Common aliases for the cmdlets above or already in this list.
+  'gm', 'gp', 'gps', 'gsv', 'gdr', 'gu', 'fw', 'fc', 'ogv', 'sleep',
+  'group', 'compare',
 ])
 
 /** Commands that write, so a plain invocation needs one approval. */
@@ -910,10 +1006,13 @@ function commandVerdict(segment, shellMode, depth = 0) {
   if (trimmed.startsWith('@{')) return 'read'
 
   // `[Type]::Method(…)`: only pure helper types are values.
-  const staticCall = /^\[([A-Za-z_][A-Za-z0-9_.]*)\]\s*::/.exec(trimmed)
+  const staticCall = /^\[([A-Za-z_][A-Za-z0-9_.]*)\]\s*::\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(trimmed)
   if (staticCall !== null) {
     const type = staticCall[1].toLowerCase().split('.').pop()
-    return READ_ONLY_STATICS.has(type) ? 'read' : 'write'
+    if (READ_ONLY_STATICS.has(type)) return 'read'
+    // A read-only method on an otherwise write-capable type: `File.OpenRead`
+    // must not be judged like `File.WriteAllText`.
+    return READ_ONLY_STATICS_METHODS.has(`${type}.${staticCall[2].toLowerCase()}`) ? 'read' : 'write'
   }
 
   const token = firstToken(trimmed)
@@ -921,7 +1020,25 @@ function commandVerdict(segment, shellMode, depth = 0) {
   const rawName = commandName(token)
   const name = BLOCK_ALIASES.get(rawName) ?? rawName
 
-  if (CONTAINER_COMMANDS.has(name) || BLOCK_COMMANDS.has(name)) {
+  if (BLOCK_COMMANDS.has(name)) {
+    const bodies = blockBodies(trimmed)
+    if (bodies.length === 0) {
+      // `ForEach-Object Name` / `Where-Object PSIsContainer` pass a property
+      // name, not a script block: there is no inner command to judge, so the
+      // segment is just the cmdlet call. A bare `$variable` after the cmdlet is
+      // an opaque script block and still fails closed.
+      const rest = trimmed.replace(/^\S+\s*/, '').replace(/^(?:-[A-Za-z]+\s*)+/, '')
+      if (rest.startsWith('$')) return 'write'
+      return READ_ONLY_COMMANDS.has(name) ? 'read' : 'write'
+    }
+    if (bodies.some(body => verdictOf(body, shellMode, depth + 1) === 'write')) return 'write'
+    // Anything after the last block is another statement of the same segment.
+    const last = trimmed.lastIndexOf('}')
+    const tail = last === -1 ? '' : trimmed.slice(last + 1).trim()
+    return tail === '' ? 'read' : verdictOf(tail, shellMode, depth + 1)
+  }
+
+  if (CONTAINER_COMMANDS.has(name)) {
     const bodies = blockBodies(trimmed)
     if (bodies.length > 0) {
       if (bodies.some(body => verdictOf(body, shellMode, depth + 1) === 'write')) return 'write'
@@ -940,6 +1057,12 @@ function commandVerdict(segment, shellMode, depth = 0) {
 
   if (READ_ONLY_COMMANDS.has(name)) return 'read'
   if (name === 'git') return gitVerdict(trimmed)
+  // `node --check x.mjs` only parses the file. A bare `node x.mjs`, `node --test`
+  // or `node -e …` runs project code, so it stays a write.
+  if (name === 'node') {
+    if (/(?:^|\s)(?:--check|-c)(?:\s|$)/.test(trimmed)) return 'read'
+    return shellMode === 'lenient' ? 'read' : 'write'
+  }
   // `sed -i` / `perl -i` edit files in place; without the flag they only read.
   if (name === 'sed' || name === 'perl') return /(?:^|\s)-\w*i/.test(trimmed) ? 'write' : 'read'
   if (WRITE_COMMANDS.has(name)) return 'write'
@@ -968,11 +1091,12 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
   const highRisk = matchHighRisk(text)
   if (highRisk !== null) {
     const label = HIGH_RISK_LABELS[highRisk.id] ?? highRisk.id
+    const why = HIGH_RISK_EXPLAIN[highRisk.id]
     return decision(
       'destructive',
       'high',
-      `High-risk command (${label}): ${short(text)}`,
-      `高危：命中「${label}」，将执行：${short(text)}`,
+      `High-risk command (${label}).${why === undefined ? '' : ` ${why.en}`} Command: ${short(text)}`,
+      `高危：命中「${label}」。${why === undefined ? '' : `风险：${why.zh}`}\n将执行：${short(text)}`,
     )
   }
 

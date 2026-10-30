@@ -20,10 +20,11 @@
  * approval too, so a rejection also stops the current turn cooperatively
  * (`agent.cancel()`) and the model waits for the user's next instruction.
  *
- * The mode can be changed in the profile patch (`mode:`) or, while the process
- * runs, through the human-only command `/write-guard on|off|status`. Slash
- * commands cannot be issued by the model, so the runtime switch cannot be used
- * to widen its own access.
+ * The policy is resolved per call in three layers: a per-session override set
+ * by the human-only command `/write-guard …`, an absolute-root workspace
+ * binding (`workspaces:`), and the configured default. Slash commands cannot be
+ * issued by the model, so the runtime switch cannot be used to widen its own
+ * access, and an override is never inherited by a subagent.
  */
 import {
   classifyToolCall,
@@ -31,6 +32,7 @@ import {
   DEFAULT_SENSITIVE_PATTERNS,
 } from './classify.js'
 import { createLogger } from './log.js'
+import { createSessionOverrides, matchWorkspace, normalizeWorkspaces, sessionKey } from './scope.js'
 
 export const name = 'write-approval-guard'
 
@@ -105,11 +107,15 @@ function normalizeConfig(raw) {
     warn('config.gateWrites must be "all", "risky" or "workspace"; keeping "all"')
   }
   // Subagents have no approval channel, so their policy can differ from the
-  // main session's. Unset inherits `gateWrites`.
-  const subagentGateWrites = normalizeGate(config.subagentGateWrites, gateWrites)
+  // main session's. `null` means "inherit whatever this call resolves to",
+  // which is not the same as a frozen copy of `gateWrites`: a workspace binding
+  // must still reach a subagent that was given no policy of its own.
+  const subagentGateWrites = GATE_MODES.has(config.subagentGateWrites) ? config.subagentGateWrites : null
   if (config.subagentGateWrites !== undefined && !GATE_MODES.has(config.subagentGateWrites)) {
-    warn('config.subagentGateWrites must be "all", "risky" or "workspace"; keeping gateWrites')
+    warn('config.subagentGateWrites must be "all", "risky" or "workspace"; inheriting gateWrites')
   }
+  // Absolute-root bindings that replace the default for one workspace.
+  const workspaces = normalizeWorkspaces(config.workspaces, 'workspaces', GATE_MODES, warn)
   return {
     mode,
     log: config.log !== false,
@@ -120,6 +126,7 @@ function normalizeConfig(raw) {
     unknownTools,
     gateWrites,
     subagentGateWrites,
+    workspaces,
     extraConfigPaths: stringList(config.extraConfigPaths, 'extraConfigPaths', []),
     protectedPaths: stringList(config.protectedPaths, 'protectedPaths', DEFAULT_PROTECTED_PATTERNS),
     highRiskConfirmations,
@@ -293,11 +300,49 @@ function withSecondStep(decision) {
 
 function usage() {
   return [
-    '用法：/write-guard [status|on|off]',
-    '  status — 显示当前模式与拦截规则',
-    '  on     — 启用（默认）',
-    '  off    — 临时关闭（重启后回到配置默认值）',
+    '用法：/write-guard [status|all|workspace|risky|on|off|reset]',
+    '  status    — 显示配置默认、工作区绑定与本会话生效值',
+    '  all       — 本会话：每次写入都审批',
+    '  workspace — 本会话：工作区内普通写入放行',
+    '  risky     — 本会话：只拦高危与敏感操作',
+    '  on        — 本会话：重新启用审批（不改门禁档位）',
+    '  off       — 本会话：临时关闭审批',
+    '  reset     — 清除本会话覆盖，回到配置/工作区绑定',
+    '',
+    '以上覆盖只作用于当前会话，重启后失效；子代理不受影响。',
   ].join('\n')
+}
+
+const SOURCE_LABEL = { config: '配置默认', workspace: '工作区绑定', session: '本会话覆盖' }
+
+/**
+ * Effective policy for one call: session override > workspace binding > config.
+ *
+ * A subagent resolves through its own knob first (`subagentGateWrites`) and then
+ * through the same binding/default chain, but never through a session override
+ * or a session-level `off`: its policy must not loosen because one human made
+ * one conversation more relaxed.
+ */
+function resolvePolicy({ config, overrides, sessionId, cwd, scope }) {
+  const override = overrides.get(sessionId)
+  const binding = matchWorkspace(cwd, config.workspaces)
+  const bound = binding === null ? undefined : binding.mode
+  if (scope === 'subagent') {
+    return {
+      mode: config.mode,
+      gateWrites: config.subagentGateWrites ?? bound ?? config.gateWrites,
+      source: config.subagentGateWrites !== null ? 'config' : binding === null ? 'config' : 'workspace',
+      binding,
+      override: undefined,
+    }
+  }
+  return {
+    mode: override?.mode ?? config.mode,
+    gateWrites: override?.gateWrites ?? bound ?? config.gateWrites,
+    source: override === undefined ? (binding === null ? 'config' : 'workspace') : 'session',
+    binding,
+    override,
+  }
 }
 
 /** Human label for one write-gate policy. */
@@ -305,11 +350,17 @@ function gateLabel(value) {
   return value === 'all' ? '全部写入' : value === 'risky' ? '仅高风险' : '工作区内放行'
 }
 
-function statusText(mode, config) {
+function statusText({ config, overrides, sessionId, cwd }) {
+  const policy = resolvePolicy({ config, overrides, sessionId, cwd, scope: 'main' })
   const high = config.highRiskConfirmations === 'double' ? '两次确认' : '仅一次确认'
+  const subagent = config.subagentGateWrites === null ? '继承解析结果' : gateLabel(config.subagentGateWrites)
+  const binding = policy.binding === null
+    ? (config.workspaces.length === 0 ? '未配置' : '未命中（当前会话不在任何绑定根下）')
+    : `${policy.binding.root} → ${gateLabel(policy.binding.mode)}`
   return [
-    `写操作审批：${mode === 'enforce' ? '启用' : '已关闭'}（配置默认：${config.mode}）`,
-    `写入门禁：${gateLabel(config.gateWrites)}（子代理：${gateLabel(config.subagentGateWrites)}）`,
+    `写操作审批：${policy.mode === 'enforce' ? '启用' : '已关闭'}（本会话 · 门禁 ${gateLabel(policy.gateWrites)} · 来源：${SOURCE_LABEL[policy.source]}）`,
+    `配置默认：${config.mode === 'enforce' ? '启用' : '已关闭'} · 门禁 ${gateLabel(config.gateWrites)}（子代理：${subagent}）`,
+    `工作区绑定：${binding}`,
     `拒绝行为：${config.onReject === 'turn' ? '拒绝并停止本轮' : '仅拒绝本次调用'}`,
     `未登记工具：${config.unknownTools === 'ask' ? '审批' : '放行'}`,
     `高危操作：${high}`,
@@ -319,7 +370,19 @@ function statusText(mode, config) {
   ].join('\n')
 }
 
-function registerCommand(ctx, config, getMode, setMode) {
+/** The session directory an invocation addresses, or null. */
+async function sessionDirFor(ctx, agent) {
+  const workingDirectory = ctx.get('workingDirectory')
+  if (workingDirectory === undefined || typeof workingDirectory.ensure !== 'function') return null
+  if (agent === undefined || agent === null) return null
+  try {
+    return await workingDirectory.ensure(agent)
+  } catch {
+    return null
+  }
+}
+
+function registerCommand(ctx, config, overrides, logger) {
   const commands = ctx.get('commands')
   if (commands === undefined || typeof commands.register !== 'function') {
     warn('commands service unavailable; /write-guard is not registered')
@@ -328,20 +391,43 @@ function registerCommand(ctx, config, getMode, setMode) {
   try {
     const definition = {
       name: 'write-guard',
-      description: '查看或切换写操作审批：on（启用）、off（临时关闭）、status。',
-      input: { hint: 'status | on | off' },
-      handler: (invocation) => {
+      description: '切换本会话的写操作审批：all / workspace / risky / on / off / reset / status。',
+      input: { hint: 'status | all | workspace | risky | on | off | reset' },
+      handler: async (invocation) => {
         const argument = invocation.rawInput.trim().toLowerCase()
+        const sessionId = sessionKey(invocation.agent)
+        const cwd = await sessionDirFor(ctx, invocation.agent)
+        const report = () => statusText({ config, overrides, sessionId, cwd })
+        const changed = (text) => {
+          const current = overrides.get(sessionId)
+          logger.write({
+            event: 'mode',
+            mode: current?.mode ?? config.mode,
+            gateWrites: current?.gateWrites ?? config.gateWrites,
+            session: sessionId === '' ? undefined : sessionId,
+          })
+          return { kind: 'success', text: `${text}\n${report()}` }
+        }
         if (argument === '' || argument === 'status') {
-          return { kind: 'success', text: statusText(getMode(), config) }
+          return { kind: 'success', text: report() }
+        }
+        if (GATE_MODES.has(argument)) {
+          // Choosing a gate also enables the guard in this session: "workspace"
+          // after "off" is meant to turn something back on.
+          overrides.patch(sessionId, { gateWrites: argument, mode: 'enforce' })
+          return changed(`本会话写入门禁已切换为「${gateLabel(argument)}」。`)
         }
         if (argument === 'on' || argument === 'enforce') {
-          setMode('enforce')
-          return { kind: 'success', text: `已启用写操作审批。\n${statusText('enforce', config)}` }
+          overrides.patch(sessionId, { mode: 'enforce' })
+          return changed('本会话已启用写操作审批。')
         }
         if (argument === 'off') {
-          setMode('off')
-          return { kind: 'success', text: `已临时关闭写操作审批（重启后恢复为 ${config.mode}）。` }
+          overrides.patch(sessionId, { mode: 'off' })
+          return changed('本会话已临时关闭写操作审批。')
+        }
+        if (argument === 'reset') {
+          overrides.delete(sessionId)
+          return changed('已清除本会话的覆盖，回到配置默认或工作区绑定。')
         }
         return { kind: 'error', text: usage() }
       },
@@ -395,11 +481,16 @@ export function apply(ctx, rawConfig) {
     return outcome
   })
 
-  let mode = config.mode
+  const overrides = createSessionOverrides()
 
-  registerCommand(ctx, config, () => mode, value => {
-    mode = value
-    logger.write({ event: 'mode', mode: value })
+  registerCommand(ctx, config, overrides, logger)
+
+  // A disposed agent must not leave an override behind: a later agent that
+  // reuses the id would inherit a mode nobody chose.
+  ctx.on('agent/disposed', payload => {
+    const agent = payload !== null && typeof payload === 'object' ? payload.agent : undefined
+    const key = sessionKey(agent)
+    if (key !== '') overrides.delete(key)
   })
 
   // Pipeline for one call:
@@ -407,11 +498,22 @@ export function apply(ctx, rawConfig) {
   //   → (turn mode: ask here) or (call mode: hand `ask` to the runtime)
   // Every branch that stops the call writes one decision log line first.
   ctx.on('tools/pre-execute', async (exec, next) => {
-    if (mode === 'off') return next()
     if (exec === null || typeof exec !== 'object' || typeof exec.name !== 'string') return next()
     if (exec.signal !== undefined && exec.signal.aborted) return { kind: 'cancel' }
 
+    const scope = isSubagentCall(ctx, exec) ? 'subagent' : 'main'
+    const sessionId = sessionKey(exec.agent)
     const cwd = await sessionCwd(ctx, exec)
+    const policy = resolvePolicy({ config, overrides, sessionId, cwd, scope })
+    if (policy.mode === 'off') return next()
+
+    // Every decision line carries the effective gate and where it came from, so
+    // "why was this allowed" is answerable from the log alone.
+    const meta = {
+      gateWrites: policy.gateWrites,
+      modeSource: policy.source,
+      session: sessionId === '' ? undefined : sessionId,
+    }
 
     let decision
     try {
@@ -433,13 +535,12 @@ export function apply(ctx, rawConfig) {
 
     if (decision === null) return next()
 
-    const scope = isSubagentCall(ctx, exec) ? 'subagent' : 'main'
-    const gateWrites = scope === 'subagent' ? config.subagentGateWrites : config.gateWrites
+    const gateWrites = policy.gateWrites
 
     // `gateWrites: "risky"` trades per-write approval for attention: ordinary
     // writes pass, only system/destructive/sensitive decisions stop here.
     if (gateWrites === 'risky' && (decision.kind === 'write' || decision.kind === 'shell-write')) {
-      logger.write({ event: 'allow', rule: 'risky', scope, tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'risky', agent: exec.agent?.id, callId: exec.callId })
+      logger.write({ event: 'allow', rule: 'risky', scope, ...meta, tool: exec.name, risk: decision.risk, kind: decision.kind, agent: exec.agent?.id, callId: exec.callId })
       return next()
     }
 
@@ -448,16 +549,16 @@ export function apply(ctx, rawConfig) {
     // `shell-write`: a command can write anywhere, and the file sandbox is not
     // assumed to be intact.
     if (gateWrites === 'workspace' && decision.kind === 'write' && decision.inWorkspace === true) {
-      logger.write({ event: 'allow', rule: 'workspace-write', scope, tool: exec.name, risk: decision.risk, kind: decision.kind, gateWrites: 'workspace', agent: exec.agent?.id, callId: exec.callId })
+      logger.write({ event: 'allow', rule: 'workspace-write', scope, ...meta, tool: exec.name, risk: decision.risk, kind: decision.kind, agent: exec.agent?.id, callId: exec.callId })
       return next()
     }
 
     if (decision.risk === 'high' && config.highRiskConfirmations === 'double') {
       rememberAsk(exec, decision)
-      logger.write({ event: 'ask', rule: 'high-risk-step1', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
+      logger.write({ event: 'ask', rule: 'high-risk-step1', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
       const first = await confirmHighRisk(ctx, exec, decision, config)
       if (first !== null) {
-        logger.write({ event: first.kind === 'cancel' ? 'cancel' : 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'high-risk-step1', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
+        logger.write({ event: first.kind === 'cancel' ? 'cancel' : 'deny', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'high-risk-step1', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
         return first
       }
       decision = withSecondStep(decision)
@@ -475,25 +576,25 @@ export function apply(ctx, rawConfig) {
       rememberAsk(exec, decision)
       const outcome = await requestDecision(ctx, exec, decision)
       if (outcome.allowed === true) {
-        logger.write({ event: 'allow', tool: exec.name, kind: decision.kind, risk: decision.risk, onReject: 'turn', agent: exec.agent?.id, callId: exec.callId })
+        logger.write({ event: 'allow', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, onReject: 'turn', agent: exec.agent?.id, callId: exec.callId })
         return next()
       }
       if (outcome.cancelled === true) {
-        logger.write({ event: 'cancel', tool: exec.name, kind: decision.kind, risk: decision.risk, agent: exec.agent?.id, callId: exec.callId })
+        logger.write({ event: 'cancel', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, agent: exec.agent?.id, callId: exec.callId })
         return { kind: 'cancel' }
       }
       if (outcome.rejected === true) {
-        logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'rejected', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
+        logger.write({ event: 'deny', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, rule: 'rejected', reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
         return rejectionDecision(exec, decision, 'approval-rejected', config)
       }
-      logger.write({ event: 'deny', tool: exec.name, kind: decision.kind, risk: decision.risk, rule: outcome.tag, agent: exec.agent?.id, callId: exec.callId })
+      logger.write({ event: 'deny', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, rule: outcome.tag, agent: exec.agent?.id, callId: exec.callId })
       return denyDecision(decision, outcome.tag)
     }
 
     if (exec.signal !== undefined && exec.signal.aborted) return { kind: 'cancel' }
 
     rememberAsk(exec, decision)
-    logger.write({ event: 'ask', tool: exec.name, kind: decision.kind, risk: decision.risk, gateWrites: config.gateWrites, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
+    logger.write({ event: 'ask', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
     return {
       kind: 'ask',
       reason: decision.reason,
