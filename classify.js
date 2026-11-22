@@ -19,7 +19,9 @@
  *   7. command parsing   — tokenisation, git/sed special cases, shell verdicts
  *   8. classifiers       — classifyShell / classifyToolCall, the entry points
  */
+import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 const WINDOWS = process.platform === 'win32'
@@ -154,6 +156,7 @@ const KNOWN_TOOLS = new Set([
   'pwsh',
   'bash',
   'shell',
+  'python',
   ...EXECUTION_WRITE_TOOLS,
   ...READ_ONLY_TOOLS,
   'grep',
@@ -463,7 +466,7 @@ const READ_ONLY_COMMANDS = new Set([
   'history', 'test-json',
   // Common aliases for the cmdlets above or already in this list.
   'gm', 'gp', 'gps', 'gsv', 'gdr', 'gu', 'fw', 'fc', 'ogv', 'sleep',
-  'group', 'compare',
+  'group', 'compare', 'break', 'continue',
 ])
 
 /** Commands that write, so a plain invocation needs one approval. */
@@ -492,6 +495,69 @@ const POSIX_TOKEN = /(?:^|[\s"'`(=[,;|&<>])(\/{1,2}[^\s"'`;|&<>)]*)/g
 
 /** A shell redirection that writes a file; `2>&1` and `=>` are excluded. */
 const REDIRECT = /(?:^|[^0-9=<])>{1,2}(?!&)\s*[^\s|&;)]/
+const REDIRECT_TARGETS = /(?:^|[^0-9=<])>{1,2}(?!&)\s*["']?([^\s|&;)"']+)["']?/g
+
+/**
+ * True when every redirect target in `text` is a benign discard sink
+ * (`/dev/null`, `NUL`, `$null`). A command that only redirects stderr/stdout
+ * to `/dev/null` does not write to the filesystem.
+ */
+function hasNonSinkRedirect(text) {
+  if (!REDIRECT.test(text)) return false
+  REDIRECT_TARGETS.lastIndex = 0
+  let match
+  let found = false
+  while ((match = REDIRECT_TARGETS.exec(text)) !== null) {
+    found = true
+    const target = match[1]
+    if (target.toLowerCase() === '$null') continue
+    if (isBenignPseudoPath(target)) continue
+    REDIRECT_TARGETS.lastIndex = 0
+    return true
+  }
+  REDIRECT_TARGETS.lastIndex = 0
+  return !found
+}
+
+/**
+ * True when an ordinary shell write exclusively targets `/tmp` / `/private/tmp`
+ * / `$TMPDIR` (e.g., `cd /tmp; curl -o x.rs; grep ...` or `workdir: "/tmp"`
+ * with relative outputs and no traversal `..`).
+ */
+function isTempScopedShellWrite(text, workdir, cwd) {
+  const tempRoots = defaultTempRoots()
+  const segments = commandSegments(text)
+  let cdTemp = false
+  if (typeof workdir === 'string' && workdir.trim() !== '') {
+    const absWorkdir = absoluteOf(workdir.trim(), cwd)
+    if (absWorkdir !== null && isTempPath(absWorkdir, tempRoots)) cdTemp = true
+  }
+  if (!cdTemp && segments.length > 0) {
+    const first = segments[0].trim()
+    const cdMatch = /^(?:cd|set-location|push-location)\s+["']?([^\s"';|&]+)["']?$/i.exec(first)
+    if (cdMatch !== null) {
+      const target = cdMatch[1]
+      if (
+        target === '/tmp'
+        || target.startsWith('/tmp/')
+        || target === '/private/tmp'
+        || target.startsWith('/private/tmp/')
+        || /^\$(?:env:)?(?:TMPDIR|TMP|TEMP)\b/i.test(target)
+        || isTempPath(target, tempRoots)
+      ) {
+        cdTemp = true
+      }
+    }
+  }
+  if (/(?:^|[\s"'`(=[,;|&])\.\.(?:[\\/\s"'`);|&]|$)/.test(text)) return false
+  if (/~[\\/]|\$HOME\b|\$env:USERPROFILE\b/i.test(text)) return false
+
+  const absTokens = collectAbsoluteTokens(text).filter(tok => !isBenignPseudoPath(tok))
+  if (cdTemp) {
+    return absTokens.every(tok => isTempPath(tok, tempRoots))
+  }
+  return absTokens.length > 0 && absTokens.every(tok => isTempPath(tok, tempRoots))
+}
 
 /** A sensitive file mentioned anywhere in a command line. */
 const SENSITIVE_TEXT = /(?:^|[\s"'`(=:,\\/])(?:\.env(?:\.[\w.-]+)?|\.envrc|\.npmrc|\.pypirc|\.netrc|\.git-credentials|\.config|id_rsa(?:\.[\w.-]+)?|id_ed25519(?:\.[\w.-]+)?|id_ecdsa(?:\.[\w.-]+)?|credentials(?:\.[\w.-]+)?|secrets?(?:\.[\w.-]+)?|[^\s"'`;|&<>\/\\]+\.(?:pem|key|pfx|p12|keystore|jks|ppk|password|config|env))(?=$|[\s"'`;|&<>),])/i
@@ -610,7 +676,92 @@ function looksSensitiveName(value) {
   return SENSITIVE_NAME.test(base)
 }
 
+/**
+ * Benign sink and pseudo-file paths on POSIX and Windows that must never be
+ * classified as high-risk system writes (`2>/dev/null`, `/proc/self/fd/...`).
+ * DSH sandboxes allow writing to `/dev/null` and `NUL` even in `read-only` mode.
+ */
+const BENIGN_PSEUDO_PATHS = new Set([
+  '/dev/null',
+  '/dev/zero',
+  '/dev/full',
+  '/dev/random',
+  '/dev/urandom',
+  '/dev/stdin',
+  '/dev/stdout',
+  '/dev/stderr',
+  '/dev/tty',
+  'nul',
+])
+
+export function isBenignPseudoPath(target) {
+  if (typeof target !== 'string' || target.trim() === '') return false
+  const normalized = target.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  if (BENIGN_PSEUDO_PATHS.has(normalized)) return true
+  if (/^\/dev\/fd\/\d+$/.test(normalized)) return true
+  if (/^\/proc\/(?:self|\d+)\/(?:fd|status|stat|cmdline|maps|environ|limits|mounts|cgroup)(?:\/.*)?$/.test(normalized)) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Ephemeral temporary directories that DSH sandboxes explicitly allow under
+ * `workspace-write` (and that hold volatile scratch files).
+ */
+export function defaultTempRoots() {
+  const roots = new Set(['/tmp', '/private/tmp', '/var/tmp'])
+  const candidates = [
+    os.tmpdir(),
+    process.env.TMPDIR,
+    process.env.TMP,
+    process.env.TEMP,
+  ]
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim() !== '') {
+      roots.add(path.resolve(value.trim()))
+      try {
+        const real = fs.realpathSync.native ? fs.realpathSync.native(value.trim()) : fs.realpathSync(value.trim())
+        roots.add(real)
+      } catch {
+        // Ignore non-existent temp candidate.
+      }
+    }
+  }
+  return [...roots]
+}
+
+export function isTempPath(target, tempRoots = defaultTempRoots()) {
+  if (typeof target !== 'string' || target.trim() === '') return false
+  const raw = target.trim()
+  const norm = raw.replace(/\\/g, '/')
+  if (norm === '/tmp' || norm.startsWith('/tmp/') || norm === '/private/tmp' || norm.startsWith('/private/tmp/')) {
+    return true
+  }
+  for (const root of tempRoots) {
+    if (typeof root === 'string' && isInside(root, raw)) return true
+  }
+  return false
+}
+
+/**
+ * Strict read-only prefix fast-path (Section 4.5): a bare read-only command
+ * (`git status|log|diff|show`, `ls`, `cat`, `head`, `tail`, `wc`, `rg`, `pwd`,
+ * `which`) with zero shell metacharacters (`; | & > < $ ( ) \`` or newlines)
+ * cannot chain or redirect, so its bypass surface is near zero.
+ */
+const STRICT_READ_ONLY_PREFIX = /^(?:git\s+(?:status|log|diff|show)|ls|cat|head|tail|wc|rg|pwd|which)\b/i
+const SHELL_METACHARACTERS = /[;|&><$()`\r\n]/
+
+export function isStrictReadOnlyCommand(command) {
+  if (typeof command !== 'string') return false
+  const trimmed = command.trim()
+  if (trimmed === '' || SHELL_METACHARACTERS.test(trimmed)) return false
+  return STRICT_READ_ONLY_PREFIX.test(trimmed)
+}
+
 function isSystemPath(target, roots) {
+  if (isBenignPseudoPath(target)) return false
   for (const root of roots) {
     if (typeof root === 'string' && isInside(root, target)) return true
   }
@@ -637,13 +788,48 @@ function decision(kind, risk, en, zh) {
   return { kind, risk, reason: en, displayReason: { en, zh } }
 }
 
+/**
+ * On Windows, a single-slash token like `'/mcp'`, `'/sse'`, `'/'`, or `cmd /c`
+ * is an HTTP route or CLI switch, not a filesystem path — UNLESS its first
+ * path component actually exists at the root of the system drive or C:\
+ * (e.g. `/Windows/Temp` -> `C:\Windows` exists). This eliminates false positives
+ * on CLI flags and route strings while remaining 100% fail-closed for real paths.
+ */
+function isNonPathWindowsSlashToken(token) {
+  if (!WINDOWS) return false
+  if (!token.startsWith('/') || token.startsWith('//')) return false
+  if (isBenignPseudoPath(token) || isTempPath(token)) return false
+  const trimmed = token.replace(/^\/+/, '').replace(/\/+$/, '')
+  if (trimmed === '') return true
+  const firstSegment = trimmed.split('/')[0]
+  if (firstSegment === '' || firstSegment === '.' || firstSegment === '..') return false
+
+  const drives = new Set(['C:\\'])
+  const sysDrive = process.env.SystemDrive
+  if (typeof sysDrive === 'string' && /^[A-Za-z]:$/.test(sysDrive.trim())) {
+    drives.add(`${sysDrive.trim()}\\`)
+  }
+  for (const driveRoot of drives) {
+    try {
+      if (fs.existsSync(path.join(driveRoot, firstSegment))) return false
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
 /** Absolute-path tokens mentioned in a command line. */
 function collectAbsoluteTokens(command) {
   const tokens = new Set()
   for (const regex of [DRIVE_TOKEN, UNC_TOKEN, POSIX_TOKEN]) {
     regex.lastIndex = 0
     let match
-    while ((match = regex.exec(command)) !== null) tokens.add(match[1])
+    while ((match = regex.exec(command)) !== null) {
+      const candidate = match[1]
+      if (regex === POSIX_TOKEN && isNonPathWindowsSlashToken(candidate)) continue
+      tokens.add(candidate)
+    }
     regex.lastIndex = 0
   }
   return [...tokens]
@@ -702,6 +888,7 @@ function gitVerdict(segment) {
 const CONTAINER_COMMANDS = new Set([
   'if', 'elseif', 'else', 'foreach', 'for', 'while', 'do', 'until', 'switch',
   'try', 'catch', 'finally', 'function', 'filter', 'begin', 'process', 'end',
+  'return', 'throw',
 ])
 
 /**
@@ -930,14 +1117,43 @@ function collectSubexpressions(command) {
 }
 
 /** `write` when the text or any of its `$( … )` substitutions writes. */
-function writesIn(text, shellMode, depth = 0) {
+function writesIn(text, shellMode, depth = 0, localReadFunctions = null) {
   if (depth > 8) return true
-  if (verdictOf(text, shellMode, depth) === 'write') return true
+  const fns = localReadFunctions ?? collectReadOnlyFunctions(text, shellMode)
+  if (verdictOf(text, shellMode, depth, fns) === 'write') return true
   for (const body of collectSubexpressions(text)) {
-    if (body.trim() !== '' && writesIn(body, shellMode, depth + 1)) return true
+    if (body.trim() !== '' && writesIn(body, shellMode, depth + 1, fns)) return true
   }
   return false
 }
+
+/**
+ * Identify local `function <Name>` definitions in `text` whose body is proven
+ * strictly read-only. If a function's body contains any write or unknown
+ * command, it is NOT added (and the `function` container itself already yields
+ * `write`), preserving strict fail-closed semantics.
+ */
+function collectReadOnlyFunctions(text, shellMode) {
+  const readOnlyFns = new Set()
+  for (const segment of commandSegments(text)) {
+    const match = /^function\s+([A-Za-z_][A-Za-z0-9_-]*)/i.exec(segment.trim())
+    if (match === null) continue
+    const fnName = match[1].toLowerCase()
+    const bodies = blockBodies(segment)
+    if (bodies.length > 0 && bodies.every(body => verdictOf(body, shellMode, 1, readOnlyFns) === 'read')) {
+      readOnlyFns.add(fnName)
+    }
+  }
+  return readOnlyFns
+}
+
+/**
+ * Pure value-access and arithmetic/comparison tail after `( … )`:
+ * allows `.Length`, `[0]`, `.Length/1KB`, `-gt 0`, `-f ...`, etc., while still
+ * rejecting any method call `(` or assignment `=` so `(Get-Item x).Delete()`
+ * remains strictly fail-closed.
+ */
+const PURE_VALUE_TAIL = /^(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d*\])*(?:\s*(?:[+/*%-]\s*[\d.]+[A-Za-z]*|-(?:eq|ne|gt|ge|lt|le|match|notmatch|like|notlike)\s+(?:\$[A-Za-z_][A-Za-z0-9_]*|[\d.]+|'[^']*'|"[^"$]*")|-f\s+[^();|&><=`]+))*$/i
 
 /**
  * `read` when the segment certainly only reads, otherwise `write`.
@@ -947,7 +1163,7 @@ function writesIn(text, shellMode, depth = 0) {
  * commands they are. Unknown commands still count as writes unless the shell
  * mode is `lenient`.
  */
-function commandVerdict(segment, shellMode, depth = 0) {
+function commandVerdict(segment, shellMode, depth = 0, localReadFunctions = null) {
   const trimmed = segment.trim()
   if (trimmed === '') return 'read'
   if (depth > 8) return 'write'
@@ -959,7 +1175,7 @@ function commandVerdict(segment, shellMode, depth = 0) {
   const assignment = /^\$[A-Za-z_][A-Za-z0-9_:]*\s*=\s*([\s\S]*)$/.exec(trimmed)
   if (assignment !== null) {
     const rhs = assignment[1].trim()
-    return rhs === '' ? 'read' : verdictOf(rhs, shellMode, depth + 1)
+    return rhs === '' ? 'read' : verdictOf(rhs, shellMode, depth + 1, localReadFunctions)
   }
 
   // `$( … )` runs the commands inside: it is a command context, not a value.
@@ -967,7 +1183,7 @@ function commandVerdict(segment, shellMode, depth = 0) {
     const close = matchingParen(trimmed, 1)
     if (close === -1) return 'write'
     const body = trimmed.slice(2, close)
-    if (body.trim() !== '' && writesIn(body, shellMode, depth + 1)) return 'write'
+    if (body.trim() !== '' && writesIn(body, shellMode, depth + 1, localReadFunctions)) return 'write'
     // A member access after the sub-expression (`.Length`, `[0]`) is a value.
     const tail = trimmed.slice(close + 1).trim()
     return tail === '' || tail.startsWith('.') || tail.startsWith('[') ? 'read' : 'write'
@@ -985,34 +1201,38 @@ function commandVerdict(segment, shellMode, depth = 0) {
   if (/^[-!+,]/.test(trimmed)) return 'read'
 
   // `( … )` is a sub-expression: judge what it contains, then decide whether
-  // the tail is a value access. Only property/index chains count, so
-  // `(Get-Item x).Delete()` still fails closed.
+  // the tail is a value access. Only property/index chains and pure arithmetic
+  // count, so `(Get-Item x).Delete()` still fails closed.
   if (trimmed.startsWith('(')) {
     const close = matchingParen(trimmed, 0)
     if (close === -1) return 'write'
     const body = trimmed.slice(1, close)
-    if (body.trim() !== '' && verdictOf(body, shellMode, depth + 1) === 'write') return 'write'
+    if (body.trim() !== '' && verdictOf(body, shellMode, depth + 1, localReadFunctions) === 'write') return 'write'
     const tail = trimmed.slice(close + 1).trim()
-    return tail === '' || /^(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d*\])+$/.test(tail) ? 'read' : 'write'
+    return tail === '' || PURE_VALUE_TAIL.test(tail) ? 'read' : 'write'
   }
 
   // `@( … )` is an array literal whose elements are expressions of their own.
   if (trimmed.startsWith('@(')) {
     const close = trimmed.lastIndexOf(')')
     const body = close === -1 ? trimmed.slice(2) : trimmed.slice(2, close)
-    return body.trim() === '' ? 'read' : verdictOf(body, shellMode, depth + 1)
+    return body.trim() === '' ? 'read' : verdictOf(body, shellMode, depth + 1, localReadFunctions)
   }
   // `@{ … }` is a hash literal: keys and values only.
   if (trimmed.startsWith('@{')) return 'read'
 
-  // `[Type]::Method(…)`: only pure helper types are values.
+  // `[Type]::Method(…)`: only pure helper types are values. If the arguments
+  // contain nested `[OtherType]::OtherMethod(...)` calls, every one of them
+  // must also be read-only.
   const staticCall = /^\[([A-Za-z_][A-Za-z0-9_.]*)\]\s*::\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(trimmed)
   if (staticCall !== null) {
-    const type = staticCall[1].toLowerCase().split('.').pop()
-    if (READ_ONLY_STATICS.has(type)) return 'read'
-    // A read-only method on an otherwise write-capable type: `File.OpenRead`
-    // must not be judged like `File.WriteAllText`.
-    return READ_ONLY_STATICS_METHODS.has(`${type}.${staticCall[2].toLowerCase()}`) ? 'read' : 'write'
+    const allStatics = [...trimmed.matchAll(/\[([A-Za-z_][A-Za-z0-9_.]*)\]\s*::\s*([A-Za-z_][A-Za-z0-9_]*)/g)]
+    const allSafe = allStatics.every(m => {
+      const t = m[1].toLowerCase().split('.').pop()
+      const method = m[2].toLowerCase()
+      return READ_ONLY_STATICS.has(t) || READ_ONLY_STATICS_METHODS.has(`${t}.${method}`)
+    })
+    return allSafe ? 'read' : 'write'
   }
 
   const token = firstToken(trimmed)
@@ -1031,31 +1251,31 @@ function commandVerdict(segment, shellMode, depth = 0) {
       if (rest.startsWith('$')) return 'write'
       return READ_ONLY_COMMANDS.has(name) ? 'read' : 'write'
     }
-    if (bodies.some(body => verdictOf(body, shellMode, depth + 1) === 'write')) return 'write'
+    if (bodies.some(body => verdictOf(body, shellMode, depth + 1, localReadFunctions) === 'write')) return 'write'
     // Anything after the last block is another statement of the same segment.
     const last = trimmed.lastIndexOf('}')
     const tail = last === -1 ? '' : trimmed.slice(last + 1).trim()
-    return tail === '' ? 'read' : verdictOf(tail, shellMode, depth + 1)
+    return tail === '' ? 'read' : verdictOf(tail, shellMode, depth + 1, localReadFunctions)
   }
 
   if (CONTAINER_COMMANDS.has(name)) {
     const bodies = blockBodies(trimmed)
     if (bodies.length > 0) {
-      if (bodies.some(body => verdictOf(body, shellMode, depth + 1) === 'write')) return 'write'
+      if (bodies.some(body => verdictOf(body, shellMode, depth + 1, localReadFunctions) === 'write')) return 'write'
       // Anything after the last block is another statement of the same segment.
       const last = trimmed.lastIndexOf('}')
       const tail = last === -1 ? '' : trimmed.slice(last + 1).trim()
-      return tail === '' ? 'read' : verdictOf(tail, shellMode, depth + 1)
+      return tail === '' ? 'read' : verdictOf(tail, shellMode, depth + 1, localReadFunctions)
     }
     // PowerShell allows `if (cond) <statement>` and `foreach (…) <command>`
     // without braces, so judge what follows the header instead of assuming an
     // empty body.
     const rest = afterHeader(trimmed)
     if (rest === null) return 'write'
-    return rest.trim() === '' ? 'read' : verdictOf(rest, shellMode, depth + 1)
+    return rest.trim() === '' ? 'read' : verdictOf(rest, shellMode, depth + 1, localReadFunctions)
   }
 
-  if (READ_ONLY_COMMANDS.has(name)) return 'read'
+  if (READ_ONLY_COMMANDS.has(name) || localReadFunctions?.has(name) === true) return 'read'
   if (name === 'git') return gitVerdict(trimmed)
   // `node --check x.mjs` only parses the file. A bare `node x.mjs`, `node --test`
   // or `node -e …` runs project code, so it stays a write.
@@ -1070,8 +1290,8 @@ function commandVerdict(segment, shellMode, depth = 0) {
 }
 
 /** `write` when any segment of `text` writes. */
-function verdictOf(text, shellMode, depth = 0) {
-  return commandSegments(text).some(segment => commandVerdict(segment, shellMode, depth) === 'write') ? 'write' : 'read'
+function verdictOf(text, shellMode, depth = 0, localReadFunctions = null) {
+  return commandSegments(text).some(segment => commandVerdict(segment, shellMode, depth, localReadFunctions) === 'write') ? 'write' : 'read'
 }
 
 /** First pattern that matches, in HIGH_RISK_PATTERNS order, or null. */
@@ -1100,9 +1320,14 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
     )
   }
 
-  const tokens = collectAbsoluteTokens(text)
+  const tokens = collectAbsoluteTokens(text).filter(token => !isBenignPseudoPath(token))
+  const sensitive = SENSITIVE_TEXT.test(text) || tokens.some(token => matchSensitive(token, sensitivePatterns) !== null)
+
+  // Fast-path (Section 4.5): strict read-only prefix with no shell metacharacters.
+  if (!sensitive && isStrictReadOnlyCommand(text)) return null
+
   const systemToken = tokens.find(token => isSystemPath(token, systemRoots)) ?? null
-  const writes = !isBalanced(text) || REDIRECT.test(text) || writesIn(text, shellMode)
+  const writes = !isBalanced(text) || hasNonSinkRedirect(text) || writesIn(text, shellMode)
 
   if (writes) {
     let systemTarget = systemToken
@@ -1122,7 +1347,7 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
       if (!CONFIG_TEXT.test(segment)) return false
       // Mentioning a path is not writing it: require a write verb or a redirect
       // in the same segment.
-      return REDIRECT.test(segment) || writesIn(segment, shellMode)
+      return hasNonSinkRedirect(segment) || writesIn(segment, shellMode)
     })
     if (configHit) {
       return decision(
@@ -1132,7 +1357,6 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
         `高危：命令将写入配置/行为文件：${short(text)}`,
       )
     }
-    const sensitive = SENSITIVE_TEXT.test(text) || tokens.some(token => matchSensitive(token, sensitivePatterns) !== null)
     if (sensitive) {
       return decision(
         'sensitive-write',
@@ -1141,6 +1365,9 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
         `命令将写入敏感文件，需要审批：${short(text)}`,
       )
     }
+    // Section 4.2: writes scoped exclusively to ephemeral `/tmp` / `$TMPDIR` pass without dialog noise.
+    if (isTempScopedShellWrite(text, workdir, cwd)) return null
+
     return decision(
       'shell-write',
       'normal',
@@ -1149,7 +1376,6 @@ export function classifyShell({ command, workdir, cwd, systemRoots = defaultSyst
     )
   }
 
-  const sensitive = SENSITIVE_TEXT.test(text) || tokens.some(token => matchSensitive(token, sensitivePatterns) !== null)
   if (sensitive) {
     return decision(
       'sensitive-read',
@@ -1294,6 +1520,80 @@ function classifySearch(tool, args, cwd, { sensitivePatterns }) {
   return null
 }
 
+const PYTHON_MUTATION_CALL = /\b(?:shutil\.(?:rmtree|move|copy|copy2|copytree)|os\.(?:remove|unlink|rmdir|removedirs|rename|replace)|pathlib\.Path\([^)]*\)\.(?:write_text|write_bytes|unlink|rmdir)|open\([^)\n]*,\s*['"][wa+x][^'"]*['"])/
+
+function classifyPython({ args, cwd, systemRoots, sensitivePatterns }) {
+  if (args === null || typeof args !== 'object') return null
+  const code = typeof args.code === 'string' ? args.code.trim() : ''
+  const workdir = typeof args.workdir === 'string' ? args.workdir.trim() : 'scratch'
+  const permissions = typeof args.sandbox_permissions === 'string' ? args.sandbox_permissions.trim() : ''
+  const isScratchReadOnly = (workdir === '' || workdir.toLowerCase() === 'scratch') && permissions === ''
+
+  const tokens = collectAbsoluteTokens(code).filter(token => !isBenignPseudoPath(token))
+  const sensitive = SENSITIVE_TEXT.test(code) || tokens.some(token => matchSensitive(token, sensitivePatterns) !== null)
+
+  // Pure scratch + read-only probes never persist to the workspace or host;
+  // only gate if the code touches a secret-bearing file.
+  if (isScratchReadOnly) {
+    if (sensitive) {
+      return decision(
+        'sensitive-read',
+        'normal',
+        `Approval required before a Python probe that references a sensitive file: ${short(args.description || code)}`,
+        `Python 探针涉及敏感文件，需要审批：${short(args.description || code)}`,
+      )
+    }
+    return null
+  }
+
+  const systemToken = tokens.find(token => isSystemPath(token, systemRoots)) ?? null
+  let systemTarget = systemToken
+  if (systemTarget === null && workdir !== '' && workdir.toLowerCase() !== 'scratch' && workdir.toLowerCase() !== 'workspace') {
+    const absWorkdir = absoluteOf(workdir, cwd)
+    if (absWorkdir !== null && isSystemPath(absWorkdir, systemRoots)) systemTarget = absWorkdir
+  }
+  if (systemTarget !== null && (permissions !== '' || PYTHON_MUTATION_CALL.test(code))) {
+    return decision(
+      'system-write',
+      'high',
+      `High-risk Python script touching a system location (${systemTarget}): ${short(args.description || code)}`,
+      `高危：Python 脚本将修改系统位置（${systemTarget}）：${short(args.description || code)}`,
+    )
+  }
+
+  if (sensitive) {
+    const writes = permissions !== '' || PYTHON_MUTATION_CALL.test(code)
+    return decision(
+      writes ? 'sensitive-write' : 'sensitive-read',
+      'normal',
+      `Approval required before a Python script that ${writes ? 'writes' : 'reads'} a sensitive file: ${short(args.description || code)}`,
+      `Python 脚本将${writes ? '写入' : '读取'}敏感文件，需要审批：${short(args.description || code)}`,
+    )
+  }
+
+  if (permissions !== '' || PYTHON_MUTATION_CALL.test(code)) {
+    return decision(
+      'shell-write',
+      'normal',
+      `Approval required before a Python script that writes outside scratch: ${short(args.description || code)}`,
+      `Python 脚本将在临时目录外写入文件，需要审批：${short(args.description || code)}`,
+    )
+  }
+  return null
+}
+
+/**
+ * Stable fingerprint of a tool call for per-session duplicate-approval
+ * deduplication (Section 4.4).
+ */
+export function callSignature(name, args) {
+  return crypto
+    .createHash('sha256')
+    .update(`${String(name)}\0${JSON.stringify(args ?? null)}`, 'utf8')
+    .digest('hex')
+    .slice(0, 16)
+}
+
 /**
  * Classify one tool call.
  *
@@ -1339,6 +1639,14 @@ export function classifyToolCall({ name, args, cwd, config = {} }) {
       shellMode,
     })
     return escalate(result, sensitiveRisk)
+  }
+
+  if (name === 'python') {
+    if (!gateShell || shellMode === 'off') return null
+    return escalate(
+      classifyPython({ args, cwd, systemRoots, sensitivePatterns }),
+      sensitiveRisk,
+    )
   }
 
   const pathReader = WRITE_TOOL_PATHS[name]

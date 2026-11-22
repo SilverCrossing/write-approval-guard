@@ -27,6 +27,7 @@
  * access, and an override is never inherited by a subagent.
  */
 import {
+  callSignature,
   classifyToolCall,
   DEFAULT_PROTECTED_PATTERNS,
   DEFAULT_SENSITIVE_PATTERNS,
@@ -457,13 +458,19 @@ export function apply(ctx, rawConfig) {
    * be attached to it later. Bounded: a call whose approval never arrives (or
    * whose process was restarted) is dropped instead of leaking memory.
    */
-  function rememberAsk(exec, decision) {
+  function rememberAsk(exec, decision, sessionId = '', sig = '') {
     if (exec.callId === undefined) return
     if (pending.size >= MAX_PENDING) {
       const oldest = pending.keys().next().value
       if (oldest !== undefined) pending.delete(oldest)
     }
-    pending.set(exec.callId, { tool: exec.name, kind: decision.kind ?? 'unknown', risk: decision.risk ?? 'normal' })
+    pending.set(exec.callId, {
+      tool: exec.name,
+      kind: decision.kind ?? 'unknown',
+      risk: decision.risk ?? 'normal',
+      sessionId,
+      sig,
+    })
   }
 
   // Observation only: let the normal answerers decide, then record the outcome.
@@ -473,6 +480,14 @@ export function apply(ctx, rawConfig) {
       const known = request.callId !== undefined ? pending.get(request.callId) : undefined
       if (known !== undefined) {
         pending.delete(request.callId)
+        if (outcome === 'allowed-once' && known.risk !== 'high' && known.sessionId && known.sig) {
+          let set = sessionApprovedCalls.get(known.sessionId)
+          if (set === undefined) {
+            set = new Set()
+            sessionApprovedCalls.set(known.sessionId, set)
+          }
+          if (set.size < 256) set.add(known.sig)
+        }
         logger.write({ event: 'approval', outcome, tool: known.tool, kind: known.kind, risk: known.risk, agent: request.agent?.id, callId: request.callId })
       }
     } catch {
@@ -482,6 +497,8 @@ export function apply(ctx, rawConfig) {
   })
 
   const overrides = createSessionOverrides()
+  // Per-session deduplication of already-approved non-high-risk calls (Section 4.4).
+  const sessionApprovedCalls = new Map()
 
   registerCommand(ctx, config, overrides, logger)
 
@@ -490,7 +507,10 @@ export function apply(ctx, rawConfig) {
   ctx.on('agent/disposed', payload => {
     const agent = payload !== null && typeof payload === 'object' ? payload.agent : undefined
     const key = sessionKey(agent)
-    if (key !== '') overrides.delete(key)
+    if (key !== '') {
+      overrides.delete(key)
+      sessionApprovedCalls.delete(key)
+    }
   })
 
   // Pipeline for one call:
@@ -535,6 +555,43 @@ export function apply(ctx, rawConfig) {
 
     if (decision === null) return next()
 
+    // Section 4.3: outside-workspace file write while the DSH sandbox is not in
+    // `danger-full-access` and the call carries no `sandbox_permissions` escalation
+    // would be rejected by the sandbox even if approved here (causing a 3-dialog
+    // loop). Deny immediately with an actionable escalation hint.
+    if (decision.kind === 'write' && decision.inWorkspace === false) {
+      const argsObj = exec.arguments !== null && typeof exec.arguments === 'object' ? exec.arguments : {}
+      const requestedPerm = typeof argsObj.sandbox_permissions === 'string' ? argsObj.sandbox_permissions : ''
+      const sandboxPolicy = ctx.get('sandboxPolicy')
+      let currentSandboxMode = null
+      if (sandboxPolicy !== undefined && typeof sandboxPolicy.resolve === 'function') {
+        try {
+          currentSandboxMode = sandboxPolicy.resolve(
+            exec.agent === undefined ? {} : { session: exec.agent.session },
+          )?.mode ?? null
+        } catch {
+          currentSandboxMode = null
+        }
+      }
+      if (
+        currentSandboxMode !== null
+        && currentSandboxMode !== 'danger-full-access'
+        && requestedPerm !== 'danger-full-access'
+      ) {
+        const fastDeny = {
+          kind: 'write',
+          risk: decision.risk,
+          reason: `${decision.reason} — blocked early: current sandbox mode is "${currentSandboxMode}", so approving here would still be denied by the file sandbox. Retry with sandbox_permissions: "danger-full-access" and a justification.`,
+          displayReason: {
+            en: `Outside-workspace write blocked under "${currentSandboxMode}" sandbox mode: approving would still be rejected by the sandbox. Retry with sandbox_permissions: "danger-full-access" + justification.`,
+            zh: `工作区外写入在当前「${currentSandboxMode}」沙箱模式下即便批准也会被沙箱拦截；请改用带 justification 的 sandbox_permissions: "danger-full-access" 单次提权重试。`,
+          },
+        }
+        logger.write({ event: 'deny', rule: 'outside-sandbox-mismatch', scope, ...meta, tool: exec.name, risk: decision.risk, kind: decision.kind, reason: String(fastDeny.reason).slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
+        return denyDecision(fastDeny, 'outside-sandbox-mismatch')
+      }
+    }
+
     const gateWrites = policy.gateWrites
 
     // `gateWrites: "risky"` trades per-write approval for attention: ordinary
@@ -553,8 +610,16 @@ export function apply(ctx, rawConfig) {
       return next()
     }
 
+    // Section 4.4: per-session deduplication for identical non-high-risk calls
+    // that the user already approved in this session.
+    const sig = decision.risk !== 'high' && sessionId !== '' ? callSignature(exec.name, exec.arguments) : ''
+    if (sig !== '' && sessionApprovedCalls.get(sessionId)?.has(sig) === true) {
+      logger.write({ event: 'allow', rule: 'session-dedup', scope, ...meta, tool: exec.name, risk: decision.risk, kind: decision.kind, agent: exec.agent?.id, callId: exec.callId })
+      return next()
+    }
+
     if (decision.risk === 'high' && config.highRiskConfirmations === 'double') {
-      rememberAsk(exec, decision)
+      rememberAsk(exec, decision, sessionId, sig)
       logger.write({ event: 'ask', rule: 'high-risk-step1', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
       const first = await confirmHighRisk(ctx, exec, decision, config)
       if (first !== null) {
@@ -573,9 +638,17 @@ export function apply(ctx, rawConfig) {
     // `onReject: "turn"` needs the outcome, so this plugin asks the ordinary
     // approval itself instead of delegating it to the runtime.
     if (config.onReject === 'turn') {
-      rememberAsk(exec, decision)
+      rememberAsk(exec, decision, sessionId, sig)
       const outcome = await requestDecision(ctx, exec, decision)
       if (outcome.allowed === true) {
+        if (sig !== '') {
+          let set = sessionApprovedCalls.get(sessionId)
+          if (set === undefined) {
+            set = new Set()
+            sessionApprovedCalls.set(sessionId, set)
+          }
+          if (set.size < 256) set.add(sig)
+        }
         logger.write({ event: 'allow', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, onReject: 'turn', agent: exec.agent?.id, callId: exec.callId })
         return next()
       }
@@ -593,7 +666,7 @@ export function apply(ctx, rawConfig) {
 
     if (exec.signal !== undefined && exec.signal.aborted) return { kind: 'cancel' }
 
-    rememberAsk(exec, decision)
+    rememberAsk(exec, decision, sessionId, sig)
     logger.write({ event: 'ask', ...meta, tool: exec.name, kind: decision.kind, risk: decision.risk, reason: String(decision.reason ?? '').slice(0, 300), agent: exec.agent?.id, callId: exec.callId })
     return {
       kind: 'ask',
